@@ -1,0 +1,78 @@
+# Build the Arch package for every version tag and attach it (and the plain
+# eep binary) to a GitHub release; the [ewe] repository's publish workflow
+# downloads that .pkg.tar.zst (the same flow as ewe-safe and Komble).
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    name: Build Arch package
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    steps:
+      - name: Install build dependencies
+        run: pacman -Syu --noconfirm --needed git rust github-cli
+
+      - name: Check out the tag
+        uses: actions/checkout@v4
+
+      - name: Build the package with makepkg
+        run: |
+          pkgver="${GITHUB_REF_NAME#v}"
+          # A tag may carry -alpha/-beta; an Arch pkgver may not hold a hyphen.
+          # 0.1.0-beta -> 0.1.0beta, the only spelling vercmp sorts BELOW the
+          # eventual 0.1.0.
+          pkgver="${pkgver//-/}"
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          cd packaging
+          # The versions go INTO the PKGBUILD, or makepkg builds whatever it
+          # was committed with and fetches a tag that doesn't exist.
+          sed -i "s/^_tag=.*/_tag=$GITHUB_REF_NAME/" PKGBUILD
+          sed -i "s/^pkgver=.*/pkgver=$pkgver/" PKGBUILD
+          grep -E '^(_tag|pkgver)=' PKGBUILD
+          # The source tarball IS this checkout: no network fetch, no checksum
+          # chicken-and-egg (makepkg uses a local file of the source's name).
+          git -C .. archive --format=tar.gz --prefix="eep-${GITHUB_REF_NAME#v}/" \
+            -o "packaging/eep-$pkgver.tar.gz" HEAD
+          useradd -m builder
+          chown -R builder: "$GITHUB_WORKSPACE"
+          # -d: nix isn't needed to build or test (the tests never call it)
+          su builder -c "makepkg -d --noconfirm --skipchecksums"
+          # the plain binary, for a quick try outside pacman
+          install -m755 "src/eep-${GITHUB_REF_NAME#v}/target/release/eep" "$GITHUB_WORKSPACE/eep"
+
+      - name: Check the package contents
+        run: |
+          pkg="$(ls packaging/eep-*.pkg.tar.zst | grep -v -- -debug- | head -1)"
+          tar --zstd -tf "$pkg" > /tmp/files
+          fail=0
+          for want in usr/bin/eep etc/eep/config.toml etc/nix/eep.conf \
+              usr/lib/tmpfiles.d/eep.conf etc/profile.d/eep.sh \
+              usr/lib/systemd/system/eep-driver.service usr/lib/systemd/system/eep-driver.timer \
+              usr/lib/systemd/user/eep-watch.service usr/lib/systemd/user/eep-updates.service \
+              usr/lib/systemd/user/eep-updates.timer \
+              usr/share/mime/packages/eep.xml usr/share/applications/eep-open.desktop; do
+            grep -qx "$want" /tmp/files || { echo "::error::missing from the package: $want"; fail=1; }
+          done
+          ! grep -q '^usr/bin/eep-build$' /tmp/files || { echo "::error::eep-build is server-side only"; fail=1; }
+          tar --zstd -xOf "$pkg" .PKGINFO | grep -E '^(pkgver|depend|backup) ='
+          ./eep --version
+          exit $fail
+
+      - name: Attach the package to the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # a tag carrying -alpha/-beta is not "Latest"
+          pre=""; case "$GITHUB_REF_NAME" in *-alpha*|*-beta*) pre="--prerelease" ;; esac
+          pkg="$(ls packaging/eep-*.pkg.tar.zst | grep -v -- -debug-)"
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" $pre \
+            --title "$GITHUB_REF_NAME" --generate-notes $pkg eep \
+          || gh release upload "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+               --clobber $pkg eep

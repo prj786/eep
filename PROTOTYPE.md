@@ -709,6 +709,27 @@ Komble and the website are being built on branches against it. Also fixed
 in ewe on `fix/launcher-hidden-folders`: the launcher indexed hidden
 folders (the owner's "firefox" found podman's 300k files).
 
+### 2026-11-22 (night): on GitHub, released
+
+Owner: "Let's commit and release, use GitHub for that."
+
+- Repo **prj786/eep** (public). CI (fmt, clippy, tests) green.
+- The eep server is public: **https://prj786.github.io/eep** (GitHub Pages
+  of the repo, an orphan `gh-pages` commit replaced on every publish, so
+  patch files never pile up in history). It is the client's default now.
+  `publish-index.yml` rebuilds it daily with native Nix on a runner
+  (newest release → index, cards, patches from the published release with
+  2 threads, pointer; keeps 3 releases and the patch sets between them).
+  First run: the runner's rebuild of B was byte-identical, nothing pushed.
+- The `eep` package (`packaging/`): everything `vm/setup-guest.sh` and
+  `eep setup` did, system-wide. The group `eep` is gone: the local cache
+  (and `/var/tmp/eep`, the patch scratch space root's driver timer shares
+  with users) is sticky and world-writable like /tmp. `eep setup` and
+  `eep driver install` write the same unit files the package ships, and
+  skip writing them when the package has. Tag `v0.1.0-beta` → release with
+  `eep-0.1.0beta-1-x86_64.pkg.tar.zst` + the plain binary; ewe-repo's
+  publish takes it (opt-in, like ewe-safe).
+
 **Open next:** owner gates — the go/no-go itself (then RFC-010), the B11
 real-GPU hour, the GitHub repo (CI builder); stretch goals (thumbnailer,
 per-app data) (Step 2

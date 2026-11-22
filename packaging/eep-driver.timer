@@ -1,0 +1,10 @@
+[Unit]
+Description=eep: keep the graphics driver current
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=6h
+RandomizedDelaySec=10min
+
+[Install]
+WantedBy=timers.target

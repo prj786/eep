@@ -1,0 +1,7 @@
+[Unit]
+Description=eep: check for app updates, free removed apps' space
+ConditionUser=!@system
+
+[Service]
+Type=oneshot
+ExecStart=sh -c '/usr/bin/eep index update >/dev/null; /usr/bin/eep updates; /usr/bin/eep gc >/dev/null'

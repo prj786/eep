@@ -169,27 +169,24 @@ fn hostname_resolves() -> Result<bool> {
 
 const SERVICE: &str = "/etc/systemd/system/eep-driver.service";
 const TIMER: &str = "/etc/systemd/system/eep-driver.timer";
+/// The package ships both units (and enables the timer).
+const PACKAGED_TIMER: &str = "/usr/lib/systemd/system/eep-driver.timer";
 
 /// The driver must move with the apps (a newer app may need a newer
 /// Mesa): a system timer repeats this step — index check, patches, no-op
 /// when current — so nobody types sudo again. Installed once, by the first
-/// `sudo eep driver install`; best effort.
+/// `sudo eep driver install`, from the same unit files the package ships;
+/// best effort.
 fn keep_current() -> bool {
-    if Path::new(TIMER).exists() {
+    if Path::new(TIMER).exists() || Path::new(PACKAGED_TIMER).exists() {
         return true;
     }
     let Ok(exe) = std::env::current_exe() else {
         return false;
     };
-    let service = format!(
-        "[Unit]\nDescription=eep: keep the graphics driver for Nix apps current\n\
-         After=network-online.target\nWants=network-online.target\n\n\
-         [Service]\nType=oneshot\nExecStart={} driver install\n",
-        exe.display()
-    );
-    let timer = "[Unit]\nDescription=eep: keep the graphics driver current\n\n\
-                 [Timer]\nOnBootSec=3min\nOnUnitActiveSec=6h\nRandomizedDelaySec=10min\n\n\
-                 [Install]\nWantedBy=timers.target\n";
+    let service = include_str!("../../../packaging/eep-driver.service")
+        .replace(crate::watch::PACKAGED_EEP, &exe.to_string_lossy());
+    let timer = include_str!("../../../packaging/eep-driver.timer");
     let written = write_atomic(Path::new(SERVICE), service.as_bytes())
         .and_then(|()| write_atomic(Path::new(TIMER), timer.as_bytes()));
     written.is_ok()

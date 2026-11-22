@@ -156,17 +156,34 @@ fn same_dir(a: &Path, b: &Path) -> bool {
     }
 }
 
-const MIME_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
-<mime-info xmlns="http://www.freedesktop.org/standards/shared-mime-info">
-  <mime-type type="application/x-eep">
-    <comment>eep app</comment>
-    <glob pattern="*.eep"/>
-  </mime-type>
-</mime-info>
-"#;
+/// The card file type, the handler and the user units: the files the
+/// package ships (`packaging/`), so a packaged install and `eep setup`
+/// wire up the same thing. `eep setup` points them at its own eep.
+const MIME_XML: &str = include_str!("../../../packaging/eep.xml");
+const HANDLER: &str = include_str!("../../../packaging/eep-open.desktop");
+const USER_UNITS: [(&str, &str); 3] = [
+    (
+        "eep-watch.service",
+        include_str!("../../../packaging/eep-watch.service"),
+    ),
+    (
+        "eep-updates.service",
+        include_str!("../../../packaging/eep-updates.service"),
+    ),
+    (
+        "eep-updates.timer",
+        include_str!("../../../packaging/eep-updates.timer"),
+    ),
+];
+/// The packaged binary every shipped file names.
+pub const PACKAGED_EEP: &str = "/usr/bin/eep";
+/// Present when the package installed eep: the units, the file type and
+/// its handler are system-wide (enabled for every user), nothing to write.
+const PACKAGED_UNITS: &str = "/usr/lib/systemd/user/eep-watch.service";
 
 /// Per-user wiring: the card file type and its handler, the watcher
-/// service and the update timer. Writes only eep's own files.
+/// service and the update timer. Writes only eep's own files, and none
+/// when the package already provides them (it only starts them then).
 pub fn setup(ctx: &Ctx) -> Result<Value> {
     let p = &ctx.p;
     let eep = ctx.eep.to_string_lossy();
@@ -176,35 +193,35 @@ pub fn setup(ctx: &Ctx) -> Result<Value> {
         .parent()
         .context("config dir")?
         .join("systemd/user");
+    let packaged = Path::new(PACKAGED_UNITS).exists();
 
-    write_atomic(&data.join("mime/packages/eep.xml"), MIME_XML.as_bytes())?;
-    let handler = format!(
-        "[Desktop Entry]\nType=Application\nName=eep\nNoDisplay=true\nMimeType=application/x-eep;\nExec={} open %f\n",
-        eep_core::desktop::quote_arg(&eep)
-    );
-    write_atomic(&p.launchers.join("eep-open.desktop"), handler.as_bytes())?;
-    write_atomic(
-        &systemd.join("eep-watch.service"),
-        format!(
-            "[Unit]\nDescription=eep: follow ~/Applications\n\n[Service]\nExecStart={eep} watch\nRestart=on-failure\n\n[Install]\nWantedBy=default.target\n"
-        )
-        .as_bytes(),
-    )?;
-    write_atomic(
-        &systemd.join("eep-updates.service"),
-        format!(
-            "[Unit]\nDescription=eep: check for app updates, free removed apps' space\n\n[Service]\nType=oneshot\nExecStart=sh -c '{eep} index update >/dev/null; {eep} updates; {eep} gc >/dev/null'\n"
-        )
-        .as_bytes(),
-    )?;
-    write_atomic(
-        &systemd.join("eep-updates.timer"),
-        b"[Unit]\nDescription=eep: check for app updates\n\n[Timer]\nOnStartupSec=2min\nOnUnitActiveSec=6h\n\n[Install]\nWantedBy=timers.target\n",
-    )?;
+    if !packaged {
+        write_atomic(&data.join("mime/packages/eep.xml"), MIME_XML.as_bytes())?;
+        let handler = HANDLER.replace(PACKAGED_EEP, &eep_core::desktop::quote_arg(&eep));
+        write_atomic(&p.launchers.join("eep-open.desktop"), handler.as_bytes())?;
+        for (name, text) in USER_UNITS {
+            write_atomic(
+                &systemd.join(name),
+                text.replace(PACKAGED_EEP, &eep).as_bytes(),
+            )?;
+        }
+    }
     std::fs::create_dir_all(&p.apps)?;
 
+    // Packaged: enabled for every user already, only start them now.
+    let start = if packaged {
+        &["start"][..]
+    } else {
+        &["enable", "--now"][..]
+    };
+    let start: Vec<String> = ["systemctl", "--user"]
+        .iter()
+        .chain(start)
+        .chain(&["eep-watch.service", "eep-updates.timer"])
+        .map(|s| (*s).to_owned())
+        .collect();
     let mut steps = Vec::new();
-    for (what, cmd) in [
+    let wiring = [
         (
             "mime",
             vec![
@@ -225,18 +242,12 @@ pub fn setup(ctx: &Ctx) -> Result<Value> {
             "reload",
             vec!["systemctl".into(), "--user".into(), "daemon-reload".into()],
         ),
-        (
-            "enable",
-            vec![
-                "systemctl".into(),
-                "--user".into(),
-                "enable".into(),
-                "--now".into(),
-                "eep-watch.service".into(),
-                "eep-updates.timer".into(),
-            ],
-        ),
-    ] {
+        ("enable", start),
+    ];
+    for (what, cmd) in wiring {
+        if packaged && what != "enable" {
+            continue;
+        }
         let ok = std::process::Command::new(&cmd[0])
             .args(&cmd[1..])
             .stdout(std::process::Stdio::null())
@@ -247,7 +258,29 @@ pub fn setup(ctx: &Ctx) -> Result<Value> {
     }
     Ok(json!({
         "ok": true,
+        "packaged": packaged,
         "steps": steps,
         "path_hint": format!("add {} to PATH for command-line apps", p.bin().display()),
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{HANDLER, PACKAGED_EEP, USER_UNITS};
+
+    /// `eep setup` points the shipped files at its own eep by replacing
+    /// the packaged path: each must name it.
+    #[test]
+    fn shipped_files_name_the_packaged_eep() {
+        for (name, text) in USER_UNITS.iter().filter(|(n, _)| n.ends_with(".service")) {
+            let exec = text.lines().find(|l| l.starts_with("ExecStart="));
+            assert!(
+                exec.is_some_and(|l| l.contains(PACKAGED_EEP)),
+                "{name} without a packaged ExecStart"
+            );
+        }
+        assert!(HANDLER.contains(&format!("Exec={PACKAGED_EEP} open %f")));
+        let driver = include_str!("../../../packaging/eep-driver.service");
+        assert!(driver.contains(&format!("ExecStart={PACKAGED_EEP} driver install")));
+    }
 }

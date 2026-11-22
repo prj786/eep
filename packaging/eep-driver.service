@@ -1,0 +1,10 @@
+[Unit]
+Description=eep: keep the graphics driver for Nix apps current
+After=network-online.target nix-daemon.socket
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# A system service has no HOME: root's index cache goes to /root/.cache/eep.
+Environment=HOME=/root
+ExecStart=/usr/bin/eep driver install

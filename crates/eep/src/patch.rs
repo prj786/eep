@@ -102,7 +102,7 @@ pub fn apply(p: &Paths, c: &Candidates, verify: bool) -> Result<Applied> {
     if !local.join("nix-cache-info").is_file() {
         bail!("{} is not set up (see vm/setup-guest.sh)", local.display());
     }
-    std::fs::create_dir_all(WORK)?;
+    work_dir()?;
     let jobs: Vec<(&String, &(String, Patch))> = c.by_piece.iter().collect();
     let http = Http::new();
     let results = par_map(&jobs, PARALLEL, |(piece, (dir, patch))| {
@@ -125,6 +125,20 @@ pub fn apply(p: &Paths, c: &Candidates, verify: bool) -> Result<Applied> {
         }
     }
     Ok(done)
+}
+
+/// Scratch space for base NARs (up to a GB each: not /tmp, often RAM).
+/// Shared like /var/tmp itself — every user and root's driver timer patch
+/// here — so whoever creates it makes it sticky and world-writable (the
+/// package's tmpfiles rule does the same).
+fn work_dir() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let w = Path::new(WORK);
+    if !w.is_dir() {
+        std::fs::create_dir_all(w).with_context(|| format!("mkdir {WORK}"))?;
+        let _ = std::fs::set_permissions(w, std::fs::Permissions::from_mode(0o1777));
+    }
+    Ok(())
 }
 
 fn apply_one(

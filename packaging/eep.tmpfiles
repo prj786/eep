@@ -1,0 +1,9 @@
+# eep's shared places. The local binary cache holds patched update pieces:
+# every user writes there (sticky, like /tmp: nobody removes another's
+# files) and nix-daemon reads it as a file:// substituter (/etc/nix/eep.conf).
+d /var/cache/eep                       0755 root root -
+d /var/cache/eep/local                 1777 root root -
+d /var/cache/eep/local/nar             1777 root root -
+f /var/cache/eep/local/nix-cache-info  0644 root root - StoreDir: /nix/store\nWantMassQuery: 0\nPriority: 10\n
+# Scratch space for rebuilding patched pieces (hundreds of MB: not /tmp).
+d /var/tmp/eep                         1777 root root -

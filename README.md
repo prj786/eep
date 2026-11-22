@@ -14,9 +14,10 @@ updates come as **binary patches** against what you already have. Nix stays
 the engine: it downloads, checks every signature and hash, and collects
 garbage.
 
-> Status: **prototype** (see [PROTOTYPE.md](PROTOTYPE.md)). It runs in the
-> ewe VM and the test container only. pacman stays the only package
-> manager on real machines until RFC-010 (house rule 10).
+> Status: **prototype, 0.1.0-beta** (see [PROTOTYPE.md](PROTOTYPE.md)).
+> Tested in the ewe VM and the test container; the `eep` package (below)
+> is opt-in. pacman stays the system's package manager (house rule 10;
+> RFC-010 decides more).
 
 ## Layout
 
@@ -27,7 +28,8 @@ garbage.
 | `crates/eep-build` | The server side: indexes and patches (drives Nix eval in podman) |
 | `catalog/apps.toml` | The apps eep offers |
 | `test/` | Container tests (Arch + `extra/nix`): `test/run.sh e2e.sh`, `test/run.sh update.sh` |
-| `vm/setup-guest.sh` | Guest setup for the ewe VM |
+| `packaging/` | The `eep` pacman package: PKGBUILD, install script, units, config |
+| `vm/setup-guest.sh` | Guest setup for the ewe VM (the package's system side, by hand) |
 | `bench/` | Benchmark scripts and `RESULTS.md` |
 | `dist/` | Builder output (git-ignored), served as-is by any static web server |
 
@@ -74,6 +76,20 @@ eep watch                   # follow ~/Apps (systemd user service, `eep setup`)
 eep doctor                  # check the setup
 sudo eep driver install     # /run/opengl-driver for Nix apps (the one root step)
 ```
+
+## Package
+
+`packaging/PKGBUILD` builds the `eep` pacman package (the client only):
+`/usr/bin/eep`; `/etc/eep/config.toml` (the server); the driver timer
+(system, started at install: no `sudo eep driver install`); the watcher
+and the update timer for every desktop user (no `eep setup`); the card
+file type and its handler; `~/.local/share/eep/bin` on PATH
+(`/etc/profile.d/eep.sh`); the shared local cache `/var/cache/eep/local`
+(sticky and world-writable like /tmp, a tmpfiles rule) and
+`/etc/nix/eep.conf`, pulled into `/etc/nix/nix.conf` by one
+`!include /etc/nix/eep.conf` line the package adds and removes. A tag
+`v*` builds it in CI (`.github/workflows/release.yml`) and attaches it to
+the GitHub release, where ewe-repo's publish picks it up.
 
 Every command prints one JSON object and exits 0; errors are
 `{"ok":false,"error":"…"}` (house rule 5). `eep run` becomes the app.

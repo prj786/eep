@@ -1,0 +1,83 @@
+# Maintainer: scubba
+#
+# eep — apps for ewe from the Nix binary cache, one card per app in
+# ~/Applications, small patch updates. Only the client (/usr/bin/eep) is
+# packaged; eep-build runs on the server side (publish-index.yml). The
+# release workflow rewrites _tag/pkgver and attaches the built package for
+# ewe-repo's publish.
+
+pkgname=eep
+# The git TAG and the pacman pkgver are different strings (a tag may carry
+# -alpha/-beta, an Arch pkgver may not hold a hyphen; 0.1.0beta sorts below
+# 0.1.0 under vercmp). The archive is addressed by the TAG, so the source URL
+# and the directory follow _tag, never pkgver.
+_tag=v0.1.0-beta
+pkgver=0.1.0beta
+pkgrel=1
+pkgdesc="eep — apps for ewe from the Nix binary cache: one card per app, small patch updates"
+arch=('x86_64')
+url="https://github.com/prj786/eep"
+license=('GPL-3.0-or-later')
+depends=(
+  'gcc-libs'
+  'glibc'
+  'nix'    # the engine: nix-daemon downloads, checks every signature, collects garbage
+  'zstd'   # applies update patches (zstd --patch-from)
+)
+optdepends=(
+  'desktop-file-utils: launcher entries take effect without a new login'
+  'xdg-utils: eep setup (per-user wiring, not needed with this package)'
+)
+makedepends=('cargo')
+backup=('etc/eep/config.toml' 'etc/nix/eep.conf')
+install=eep.install
+# Arch's makepkg LTO breaks linking the `ring` crate's assembly (see Komble's
+# PKGBUILD); Rust-level LTO stays on in Cargo.toml.
+options=(!lto !debug)
+
+source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/$_tag.tar.gz")
+sha256sums=('SKIP')
+
+prepare() {
+  cd "$srcdir/$pkgname-${_tag#v}"
+  export RUSTUP_TOOLCHAIN=stable
+  cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+  cd "$srcdir/$pkgname-${_tag#v}"
+  export RUSTUP_TOOLCHAIN=stable
+  cargo build --release --frozen -p eep
+}
+
+check() {
+  cd "$srcdir/$pkgname-${_tag#v}"
+  export RUSTUP_TOOLCHAIN=stable
+  cargo test --release --frozen -p eep -p eep-core
+}
+
+package() {
+  cd "$srcdir/$pkgname-${_tag#v}"
+  install -Dm755 target/release/eep "$pkgdir/usr/bin/eep"
+
+  # every user's server, and root's (the driver timer)
+  install -Dm644 packaging/config.toml "$pkgdir/etc/eep/config.toml"
+  # the local cache for patched pieces: nix.conf includes it (eep.install)
+  install -Dm644 packaging/nix-eep.conf "$pkgdir/etc/nix/eep.conf"
+  install -Dm644 packaging/eep.tmpfiles "$pkgdir/usr/lib/tmpfiles.d/eep.conf"
+
+  # the graphics driver for Nix apps (root), kept current
+  install -Dm644 packaging/eep-driver.service packaging/eep-driver.timer \
+    -t "$pkgdir/usr/lib/systemd/system/"
+  # per desktop user: follow ~/Applications, check for updates
+  install -Dm644 packaging/eep-watch.service packaging/eep-updates.service \
+    packaging/eep-updates.timer -t "$pkgdir/usr/lib/systemd/user/"
+
+  # cards (*.eep) are a file type; double-click → eep open
+  install -Dm644 packaging/eep.xml "$pkgdir/usr/share/mime/packages/eep.xml"
+  install -Dm644 packaging/eep-open.desktop "$pkgdir/usr/share/applications/eep-open.desktop"
+  # command-line apps on PATH
+  install -Dm644 packaging/eep.sh "$pkgdir/etc/profile.d/eep.sh"
+
+  install -Dm644 README.md docs/CARD.md -t "$pkgdir/usr/share/doc/$pkgname/"
+}

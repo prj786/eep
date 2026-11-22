@@ -1,0 +1,11 @@
+[Unit]
+Description=eep: follow ~/Applications
+# Desktop users only, not the greeter's or other system users' sessions.
+ConditionUser=!@system
+
+[Service]
+ExecStart=/usr/bin/eep watch
+Restart=on-failure
+
+[Install]
+WantedBy=default.target

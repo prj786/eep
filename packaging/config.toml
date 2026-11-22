@@ -1,0 +1,5 @@
+# eep's server and channel for every user and for root's driver timer. A
+# user's ~/.config/eep/config.toml wins over this file; EEP_SERVER and
+# EEP_CHANNEL win over both.
+server = "https://prj786.github.io/eep"
+channel = "nixos-unstable"

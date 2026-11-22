@@ -1,0 +1,72 @@
+# eep's system side: what vm/setup-guest.sh does by hand, for a packaged
+# install. Every step is best effort: a package install runs as root,
+# outside any session, maybe in a chroot (pacstrap) where systemctl only
+# enables.
+
+_nix_conf=/etc/nix/nix.conf
+_include='!include /etc/nix/eep.conf'
+_mark='# eep: the local cache for patched updates (removed with the eep package)'
+
+# nix.conf belongs to the nix package; eep only adds (and later removes)
+# one marked line pointing at its own file. `!include` (not `include`)
+# so a missing eep.conf can never break Nix.
+_include_add() {
+    [ -f "$_nix_conf" ] || return 0
+    grep -qxF "$_include" "$_nix_conf" && return 0
+    printf '\n%s\n%s\n' "$_mark" "$_include" >> "$_nix_conf"
+}
+
+_include_remove() {
+    [ -f "$_nix_conf" ] || return 0
+    grep -qxF "$_include" "$_nix_conf" || return 0
+    # the line, its mark, and the blank line _include_add put before them
+    awk -v inc="$_include" -v mark="$_mark" '
+        $0 == "" { blank++; next }
+        $0 == mark || $0 == inc { blank = 0; next }
+        { while (blank > 0) { print ""; blank-- } print }' "$_nix_conf" > "$_nix_conf.eep-tmp" \
+        && cat "$_nix_conf.eep-tmp" > "$_nix_conf"
+    rm -f "$_nix_conf.eep-tmp"
+}
+
+_q() { "$@" >/dev/null 2>&1 || true; }
+
+post_install() {
+    _q systemd-tmpfiles --create /usr/lib/tmpfiles.d/eep.conf
+    _include_add
+    _q systemctl daemon-reload
+    _q systemctl enable --now nix-daemon.socket
+    # the daemon re-reads nix.conf (and eep.conf) when it restarts
+    _q systemctl try-restart nix-daemon.service
+    # the graphics driver for Nix apps: set up now (in the background), kept
+    # current every 6 h
+    _q systemctl enable --now eep-driver.timer
+    _q systemctl start --no-block eep-driver.service
+    # every desktop user: the ~/Applications watcher and the update check
+    _q systemctl --global enable eep-watch.service eep-updates.timer
+    _q update-mime-database /usr/share/mime
+    echo ":: eep is installed. Apps go into ~/Applications (eep install <app>, or a"
+    echo "   card from Komble or the website). The graphics driver for them is being"
+    echo "   set up now: systemctl status eep-driver.service"
+    echo "   Log out and back in once (or: systemctl --user start eep-watch.service)."
+}
+
+post_upgrade() {
+    _q systemd-tmpfiles --create /usr/lib/tmpfiles.d/eep.conf
+    _include_add
+    _q systemctl try-restart nix-daemon.service
+    _q update-mime-database /usr/share/mime
+    # A running `eep watch` restarts as the new eep by itself.
+}
+
+pre_remove() {
+    _q systemctl disable --now eep-driver.timer
+    _q systemctl --global disable eep-watch.service eep-updates.timer
+}
+
+post_remove() {
+    _include_remove
+    _q systemctl try-restart nix-daemon.service
+    _q update-mime-database /usr/share/mime
+    echo ":: eep is removed. Apps it installed stay in /nix/store until"
+    echo "   nix-store --gc; /var/cache/eep and /var/lib/eep can be deleted."
+}
