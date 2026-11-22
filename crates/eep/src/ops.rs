@@ -10,7 +10,7 @@ use eep_core::index::{App, Index};
 use serde_json::{Value, json};
 
 use crate::paths::{Paths, write_atomic};
-use crate::{cards, env, integrate, journal, nix, patch, state};
+use crate::{cards, env, integrate, journal, nix, patch, state, system};
 
 /// How long the previous version stays for `eep rollback`.
 const KEEP_PREVIOUS: Duration = Duration::from_secs(7 * 24 * 3600);
@@ -29,6 +29,15 @@ pub struct Fetch {
     pub patches: bool,
     /// eep's own hash check of patched pieces (off only for the tamper test).
     pub verify: bool,
+}
+
+impl Default for Fetch {
+    fn default() -> Self {
+        Self {
+            patches: true,
+            verify: true,
+        }
+    }
 }
 
 fn store_paths(names: &[String]) -> Vec<String> {
@@ -75,6 +84,7 @@ fn installed_releases(p: &Paths) -> BTreeSet<String> {
     cards::all(p)
         .0
         .into_iter()
+        .filter(|f| !f.card.is_system())
         .map(|f| f.card.release)
         .collect()
 }
@@ -92,8 +102,23 @@ fn one_or_many(mut results: Vec<Value>) -> Value {
 
 pub fn install(ctx: &Ctx, ids: &[String], fetch: Fetch) -> Result<Value> {
     let _lock = state::lock(&ctx.p)?;
+    // Found apps (`sys-…`) only come back: nothing to fetch.
+    let (found, ids): (Vec<String>, Vec<String>) = ids
+        .iter()
+        .cloned()
+        .partition(|i| i.starts_with(card::SYSTEM_PREFIX));
+    if !found.is_empty() {
+        let find = state::config(&ctx.p)?.find_apps;
+        let shown = found
+            .iter()
+            .map(|id| system::show(&ctx.p, id, find))
+            .collect::<Result<Vec<_>>>()?;
+        if ids.is_empty() {
+            return Ok(one_or_many(shown));
+        }
+    }
     let idx = state::index_or_fetch(&ctx.p)?;
-    let mut v = install_many(ctx, &idx, ids, fetch)?;
+    let mut v = install_many(ctx, &idx, &ids, fetch)?;
     // One app: its fields at the top level, next to the totals.
     if let Some(apps) = v["apps"].as_array().filter(|a| a.len() == 1).cloned()
         && let (Some(o), Some(app)) = (v.as_object_mut(), apps[0].as_object())
@@ -237,6 +262,10 @@ fn finish_one(
         id: id.to_owned(),
         name: app.name.clone(),
         kind: app.kind,
+        source: Default::default(),
+        from: None,
+        entry: None,
+        package: None,
         channel: idx.channel.clone(),
         release: idx.release.clone(),
         version: app.version.clone(),
@@ -252,6 +281,9 @@ fn finish_one(
         icon_type: None,
         icon_data: None,
     };
+    // The index was checked on load; the card's own checks run again here,
+    // before anything is written from it.
+    Card::parse(&card.to_toml()).with_context(|| format!("{id}: the index gave a bad card"))?;
     let integrated = integrate::integrate(p, &card, &ctx.eep)?;
     // The card carries its icon, so Files shows the app on the card itself.
     if let Some(icon) = &integrated.icon
@@ -276,28 +308,50 @@ pub fn remove(ctx: &Ctx, ids: &[String]) -> Result<Value> {
     let _lock = state::lock(&ctx.p)?;
     let mut results = Vec::new();
     for id in ids {
-        let found = cards::find(&ctx.p, id);
-        if let Some(f) = &found {
-            std::fs::remove_file(&f.file)
-                .with_context(|| format!("removing {}", f.file.display()))?;
+        if id.starts_with(card::SYSTEM_PREFIX) {
+            let find = state::config(&ctx.p)?.find_apps;
+            results.push(system::remove(&ctx.p, id, find)?);
+            continue;
+        }
+        // every card for the app (a copy would bring it back otherwise)
+        let mine: Vec<PathBuf> = cards::all(&ctx.p)
+            .0
+            .into_iter()
+            .filter(|f| f.card.id == *id)
+            .map(|f| f.file)
+            .collect();
+        for f in &mine {
+            std::fs::remove_file(f).with_context(|| format!("removing {}", f.display()))?;
         }
         let mut r = integrate::forget(&ctx.p, id)?;
-        r["card"] = json!(found.map(|f| f.file));
+        r["card"] = json!(mine.first());
         results.push(r);
     }
     Ok(one_or_many(results))
 }
 
-pub fn list(ctx: &Ctx) -> Result<Value> {
+/// The cards. eep's own apps only, unless `all`: stores list found apps
+/// (pacman's, AppImages…) under their own source already.
+pub fn list(ctx: &Ctx, all: bool) -> Result<Value> {
     let (good, bad) = cards::all(&ctx.p);
     let apps: Vec<Value> = good
         .iter()
+        .filter(|f| all || !f.card.is_system())
         .map(|f| {
+            let c = &f.card;
+            if c.is_system() {
+                return json!({
+                    "id": c.id, "name": c.name, "kind": c.kind, "source": c.source,
+                    "from": c.from, "entry": c.entry, "package": c.package,
+                    "version": c.version, "card": f.file,
+                    "present": system::entry_file(&ctx.p, c).is_some(),
+                });
+            }
             json!({
-                "id": f.card.id, "name": f.card.name, "kind": f.card.kind,
-                "version": f.card.version, "release": f.card.release, "out": f.card.out,
-                "present": Path::new(&f.card.out).exists(), "card": f.file,
-                "previous_version": f.card.previous_version,
+                "id": c.id, "name": c.name, "kind": c.kind, "source": c.source,
+                "version": c.version, "release": c.release, "out": c.out,
+                "present": Path::new(&c.out).exists(), "card": f.file,
+                "previous_version": c.previous_version,
             })
         })
         .collect();
@@ -448,6 +502,12 @@ pub fn rollback(ctx: &Ctx, id: &str) -> Result<Value> {
     let _lock = state::lock(&ctx.p)?;
     let p = &ctx.p;
     let f = cards::find(p, id).with_context(|| format!("{id} is not installed"))?;
+    if f.card.is_system() {
+        bail!(
+            "{} is not an eep app: its own package manager updates it",
+            f.card.name
+        );
+    }
     let mut card = f.card;
     let prev = card
         .previous
@@ -460,10 +520,10 @@ pub fn rollback(ctx: &Ctx, id: &str) -> Result<Value> {
     nix::realise(&card.out, &p.prev_root(id))?;
     // Current ⇄ previous: store path, version and release travel together.
     std::mem::swap(&mut card.out, card.previous.get_or_insert_default());
-    std::mem::swap(
-        &mut card.version,
-        card.previous_version.get_or_insert_default(),
-    );
+    // a card from before eep kept these may lack them: keep what it has
+    if let Some(v) = card.previous_version.as_mut() {
+        std::mem::swap(&mut card.version, v);
+    }
     if let Some(r) = card.previous_release.as_mut() {
         std::mem::swap(&mut card.release, r);
     }
@@ -482,15 +542,28 @@ pub fn rollback(ctx: &Ctx, id: &str) -> Result<Value> {
 pub fn reconcile(ctx: &Ctx, full: bool) -> Result<Value> {
     let _lock = state::lock(&ctx.p)?;
     let p = &ctx.p;
+    // Found apps first: it is quick (no download), so the cards of every
+    // app on the computer are there before a slow fetch below starts.
+    let found = match system::pass(p, state::config(p).map_or(true, |c| c.find_apps)) {
+        Ok(r) => json!(r),
+        Err(e) => json!({ "error": format!("{e:#}") }),
+    };
     let recovered = journal::recover(p)?;
     let fetching = journal::begin(p, "repair")?;
+    clean_stale_roots(p);
     let launchers = integrate::launcher_owners(p);
-    let (good, bad) = cards::all(p);
+    let cards::Listing {
+        good,
+        bad,
+        kept,
+        sure,
+    } = cards::listing(p);
     let mut touched = Vec::new();
-    let mut ids = BTreeSet::new();
+    // a card that doesn't parse still keeps its app
+    let mut ids: BTreeSet<String> = kept;
     for f in &good {
         let c = &f.card;
-        if !ids.insert(c.id.clone()) {
+        if !ids.insert(c.id.clone()) || c.is_system() {
             continue; // a second card for the same app: the first one counts
         }
         let present = Path::new(&c.out).exists();
@@ -522,9 +595,13 @@ pub fn reconcile(ctx: &Ctx, full: bool) -> Result<Value> {
         }
         touched.push(json!({ "id": c.id, "fetched": !present }));
     }
+    // Only a sure listing may forget: a moved or unreadable ~/Applications,
+    // or a card whose id can't be read, must never uninstall anything.
     let mut forgotten = Vec::new();
-    for id in integrate::known_ids(p).difference(&ids) {
-        forgotten.push(integrate::forget(p, id)?);
+    if sure {
+        for id in integrate::known_ids(p).difference(&ids) {
+            forgotten.push(integrate::forget(p, id)?);
+        }
     }
     drop(fetching);
     let bad: Vec<Value> = bad
@@ -533,8 +610,29 @@ pub fn reconcile(ctx: &Ctx, full: bool) -> Result<Value> {
         .collect();
     Ok(json!({
         "ok": true, "apps": touched, "forgotten": forgotten, "bad_cards": bad,
-        "recovered": recovered,
+        "recovered": recovered, "found": found, "sure": sure,
     }))
+}
+
+/// `.batch-<pid>` / `.trash-<pid>` roots bridge one command; a command
+/// killed half way leaves them, and their pieces would never be collected.
+fn clean_stale_roots(p: &Paths) {
+    let Ok(rd) = std::fs::read_dir(&p.roots) else {
+        return;
+    };
+    for e in rd.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        let pid = name
+            .strip_prefix(".batch-")
+            .or_else(|| name.strip_prefix(".trash-"))
+            .and_then(|n| n.parse::<u32>().ok());
+        if let Some(pid) = pid
+            && pid != std::process::id()
+            && !Path::new(&format!("/proc/{pid}")).exists()
+        {
+            let _ = std::fs::remove_dir_all(e.path());
+        }
+    }
 }
 
 /// Whether the app's launcher entry and shims are in place.
@@ -552,6 +650,9 @@ fn integrated(
 pub fn gc(ctx: &Ctx, dry_run: bool) -> Result<Value> {
     let _lock = state::lock(&ctx.p)?;
     let t0 = Instant::now();
+    if !dry_run {
+        clean_stale_roots(&ctx.p);
+    }
     let mut expired = Vec::new();
     if let Ok(rd) = std::fs::read_dir(&ctx.p.roots) {
         for e in rd.flatten() {
@@ -616,6 +717,7 @@ fn trash_cards() -> Vec<Card> {
                 .map(|e| e.path())
                 .filter(|f| f.extension().is_some_and(|x| x == card::EXTENSION))
                 .filter_map(|f| Card::parse(&std::fs::read_to_string(f).ok()?).ok())
+                .filter(|c| !c.is_system())
                 .collect()
         })
         .unwrap_or_default()
@@ -661,6 +763,7 @@ pub fn doctor(ctx: &Ctx, app: Option<&str>) -> Result<Value> {
         "bin": { "dir": p.bin(), "on_path": path_ok },
         "apps_dir": p.apps,
         "cards": good.len(),
+        "found_apps": { "on": cfg.find_apps, "cards": good.iter().filter(|f| f.card.is_system()).count() },
         "bad_cards": bad.iter().map(|(f, e)| json!({ "card": f, "error": e })).collect::<Vec<_>>(),
         "env": env::to_json(&env::plan(|k| std::env::var_os(k), &home, Path::exists)),
     });
@@ -669,8 +772,11 @@ pub fn doctor(ctx: &Ctx, app: Option<&str>) -> Result<Value> {
     v["ready"] = json!(store.is_ok() && v["index"].is_object() && v["driver"]["ok"] == true);
     if let Some(id) = app {
         let f = cards::find(p, id).with_context(|| format!("{id} is not installed"))?;
-        v["app"] =
-            json!({ "id": id, "out": f.card.out, "present": Path::new(&f.card.out).exists() });
+        v["app"] = if f.card.is_system() {
+            json!({ "id": id, "entry": system::entry_file(p, &f.card), "present": system::entry_file(p, &f.card).is_some() })
+        } else {
+            json!({ "id": id, "out": f.card.out, "present": Path::new(&f.card.out).exists() })
+        };
     }
     Ok(v)
 }

@@ -23,6 +23,9 @@ pub const DEFAULT_CHANNEL: &str = "nixos-unstable";
 pub struct Config {
     pub server: String,
     pub channel: String,
+    /// Give every app on the computer a card (pacman, AppImages, Steam,
+    /// the user's own launcher entries), not only eep's.
+    pub find_apps: bool,
 }
 
 impl Default for Config {
@@ -30,6 +33,7 @@ impl Default for Config {
         Self {
             server: DEFAULT_SERVER.into(),
             channel: DEFAULT_CHANNEL.into(),
+            find_apps: true,
         }
     }
 }
@@ -51,6 +55,9 @@ pub fn config(p: &Paths) -> Result<Config> {
         cfg.channel = c;
     }
     cfg.server = cfg.server.trim_end_matches('/').to_owned();
+    if !eep_core::index::valid_name(&cfg.channel) {
+        bail!("strange channel {:?} in the config", cfg.channel);
+    }
     Ok(cfg)
 }
 
@@ -73,7 +80,10 @@ pub fn load_index(p: &Paths) -> Result<Index> {
     let Ok(bytes) = std::fs::read(p.index_file()) else {
         bail!("no index yet: run `eep index update`");
     };
-    serde_json::from_slice(&bytes).context("the cached index is damaged: run `eep index update`")
+    let idx: Index = serde_json::from_slice(&bytes)
+        .context("the cached index is damaged: run `eep index update`")?;
+    idx.validate()?;
+    Ok(idx)
 }
 
 /// The cached index, fetching it first if there is none.
@@ -120,11 +130,9 @@ pub fn update_index(p: &Paths) -> Result<Value> {
         }
     };
     let ptr: ChannelPointer = serde_json::from_slice(&ptr_bytes).context("bad channel pointer")?;
+    ptr.validate()?;
     let changed = !have_index || ptr.release != meta.release || ptr.sha256 != meta.sha256;
     if changed {
-        if ptr.index.contains("..") || ptr.index.starts_with('/') {
-            bail!("channel pointer names a strange index path {:?}", ptr.index);
-        }
         let idx_url = format!("{}/{}", cfg.server, ptr.index);
         let zst = http
             .get_bytes(&idx_url)?
@@ -147,6 +155,7 @@ pub fn update_index(p: &Paths) -> Result<Value> {
         if idx.release != ptr.release || idx.channel != cfg.channel {
             bail!("index doesn't match its channel pointer");
         }
+        idx.validate()?;
         write_atomic(&p.index_file(), &json_bytes)?;
         cache_icons(p, &cfg.server, &idx);
         meta.release.clone_from(&ptr.release);
@@ -166,7 +175,10 @@ pub fn lock(p: &Paths) -> Result<File> {
         .truncate(false)
         .write(true)
         .open(dir.join("lock"))?;
-    f.lock().context("taking eep's lock")?;
+    if f.try_lock().is_err() {
+        eprintln!("eep: waiting for another eep to finish…");
+        f.lock().context("taking eep's lock")?;
+    }
     Ok(f)
 }
 

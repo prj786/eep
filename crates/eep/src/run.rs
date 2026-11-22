@@ -22,6 +22,16 @@ pub fn run(
     let found = cards::find(p, id)
         .with_context(|| format!("{id} is not installed (no card in {})", p.apps.display()))?;
     let card = found.card;
+    if card.is_system() {
+        // An app found on the computer: its own launcher entry starts it.
+        if exec.is_some() || !extra_env.is_empty() {
+            bail!(
+                "{} is not an eep app: --exec and --env don't apply",
+                card.name
+            );
+        }
+        return crate::system::launch(p, &card, args);
+    }
     let out = PathBuf::from(&card.out);
     if !out.exists() {
         // A card copied in from elsewhere, or collected: fetch it now.

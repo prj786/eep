@@ -64,3 +64,168 @@ attr = "vulkan-tools"
 name = "Vulkan tools"
 kind = "tool"
 bin = ["vulkaninfo", "vkcube"]
+
+# ── 2026-11-22: the owner's apps (free and in the cache) ─────────────────
+
+[brave]
+attr = "brave"
+name = "Brave"
+desktop = "brave-browser.desktop"
+
+[zed]
+attr = "zed-editor"
+name = "Zed"
+desktop = "dev.zed.Zed.desktop"
+
+[obs-studio]
+attr = "obs-studio"
+name = "OBS Studio"
+desktop = "com.obsproject.Studio.desktop"
+
+[nextcloud]
+attr = "nextcloud-client"
+name = "Nextcloud"
+desktop = "com.nextcloud.desktopclient.nextcloud.desktop"
+
+[mpv]
+attr = "mpv"
+name = "mpv"
+desktop = "mpv.desktop"
+
+[zathura]
+attr = "zathura"
+name = "Zathura"
+desktop = "org.pwmt.zathura.desktop"
+
+[pavucontrol]
+attr = "pavucontrol"
+name = "Volume Control"
+desktop = "org.pulseaudio.pavucontrol.desktop"
+
+[galculator]
+attr = "galculator"
+name = "Galculator"
+
+[guvcview]
+attr = "guvcview"
+name = "guvcview"
+
+[heroic]
+attr = "heroic"
+name = "Heroic Games Launcher"
+
+[bottles]
+attr = "bottles"
+name = "Bottles"
+desktop = "com.usebottles.bottles.desktop"
+
+# ── popular desktop apps ─────────────────────────────────────────────────
+
+[thunderbird]
+attr = "thunderbird"
+name = "Thunderbird"
+desktop = "thunderbird.desktop"
+
+[chromium]
+attr = "chromium"
+name = "Chromium"
+desktop = "chromium-browser.desktop"
+
+[inkscape]
+attr = "inkscape"
+name = "Inkscape"
+desktop = "org.inkscape.Inkscape.desktop"
+
+[krita]
+attr = "krita"
+name = "Krita"
+desktop = "org.kde.krita.desktop"
+
+[blender]
+attr = "blender"
+name = "Blender"
+desktop = "blender.desktop"
+
+[audacity]
+attr = "audacity"
+name = "Audacity"
+desktop = "org.audacityteam.Audacity.desktop"
+
+[kdenlive]
+attr = "kdePackages.kdenlive"
+name = "Kdenlive"
+desktop = "org.kde.kdenlive.desktop"
+
+[shotcut]
+attr = "shotcut"
+name = "Shotcut"
+
+[darktable]
+attr = "darktable"
+name = "darktable"
+desktop = "org.darktable.darktable.desktop"
+
+[handbrake]
+attr = "handbrake"
+name = "HandBrake"
+desktop = "fr.handbrake.ghb.desktop"
+
+[signal]
+attr = "signal-desktop"
+name = "Signal"
+
+[element]
+attr = "element-desktop"
+name = "Element"
+
+[keepassxc]
+attr = "keepassxc"
+name = "KeePassXC"
+desktop = "org.keepassxc.KeePassXC.desktop"
+
+[qbittorrent]
+attr = "qbittorrent"
+name = "qBittorrent"
+desktop = "org.qbittorrent.qBittorrent.desktop"
+
+[celluloid]
+attr = "celluloid"
+name = "Celluloid"
+desktop = "io.github.celluloid_player.Celluloid.desktop"
+
+[foliate]
+attr = "foliate"
+name = "Foliate"
+desktop = "com.github.johnfactotum.Foliate.desktop"
+
+[text-editor]
+attr = "gnome-text-editor"
+name = "Text Editor"
+desktop = "org.gnome.TextEditor.desktop"
+
+# ── command-line apps (on PATH after pacman's own, never before) ─────────
+
+[btop]
+attr = "btop"
+name = "btop"
+kind = "cli"
+
+[fd]
+attr = "fd"
+name = "fd"
+kind = "cli"
+
+[bat]
+attr = "bat"
+name = "bat"
+kind = "cli"
+
+[eza]
+attr = "eza"
+name = "eza"
+kind = "cli"
+
+[yt-dlp]
+attr = "yt-dlp"
+name = "yt-dlp"
+kind = "cli"

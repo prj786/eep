@@ -7,6 +7,15 @@ apps; a card downloaded from the website or put there by Komble installs
 the same way. The contract for Files, Komble and the website:
 [docs/CARD.md](docs/CARD.md).
 
+**Every app gets a card** (0.2), not only eep's: apps already on the
+computer — pacman packages, Komble's AppImages, Steam games, your own
+launcher entries, ewe's apps — are *found* and get a `source = "system"`
+card (`sys-<desktop id>`), icon included. A new pacman app gets its card
+within a second. Removing such a card **hides** the app from the launcher
+(its file types keep working); restoring the card shows it again; nothing
+is downloaded or uninstalled (pacman or Komble still do that, and the card
+then goes by itself). `find_apps = false` in the config turns it off.
+
 Underneath, apps come prebuilt and signed from the Nix binary cache
 (cache.nixos.org). The client **never evaluates Nix**: an eep server
 precomputes an index that says exactly which store paths an app needs, and
@@ -14,7 +23,7 @@ updates come as **binary patches** against what you already have. Nix stays
 the engine: it downloads, checks every signature and hash, and collects
 garbage.
 
-> Status: **prototype, 0.1.0-beta** (see [PROTOTYPE.md](PROTOTYPE.md)).
+> Status: **0.2.0-beta** (see [PROTOTYPE.md](PROTOTYPE.md)).
 > Tested in the ewe VM and the test container; the `eep` package (below)
 > is opt-in. pacman stays the system's package manager (house rule 10;
 > RFC-010 decides more).
@@ -65,11 +74,12 @@ eep index update            # fetch the newest index (conditional GET)
 eep available               # what can be installed
 eep install firefox         # → ~/Applications/Firefox.eep, launcher entry, icon
 eep run firefox             # what the launcher entry calls: clean env, exec
-eep list                    # the cards
+eep list [--all]            # eep's apps (--all: and every app found on the computer)
 eep updates [--count]       # what an update costs, with and without patches
 eep update [ids…]           # patches where possible, the rest upstream
 eep rollback firefox        # the previous version, instantly (kept 7 days)
 eep remove firefox          # card, launcher entry, roots; disk freed by gc
+eep remove sys-gimp         # a found app: hidden, not uninstalled (eep install sys-gimp shows it)
 eep gc [--dry-run]          # also runs by itself; keeps apps whose card is in the Trash
 eep repair                  # rebuild everything from the cards
 eep watch                   # follow ~/Applications (a systemd user service; the package enables it)
@@ -92,7 +102,14 @@ file type and its handler; `~/.local/share/eep/bin` on PATH
 the GitHub release, where ewe-repo's publish picks it up.
 
 Every command prints one JSON object and exits 0; errors are
-`{"ok":false,"error":"…"}` (house rule 5). `eep run` becomes the app.
+`{"ok":false,"error":"…"}` (house rule 5), a mistyped command included.
+`eep run` becomes the app.
+
+`eep gc` (every few hours, from each user's update timer) is a
+system-wide `nix-store --gc`: on a machine where someone also uses Nix by
+hand, unrooted `nix-shell` results go with it, and an app another user just
+moved to the Trash is kept only for that user. Fine for an ewe box with
+one person; worth knowing on a shared one.
 
 ## Developing
 

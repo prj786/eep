@@ -14,6 +14,30 @@ pub const EXTENSION: &str = "eep";
 /// Largest icon a card carries (decoded bytes).
 pub const ICON_MAX: usize = 96 * 1024;
 
+/// Where a card's app comes from.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Source {
+    /// eep fetched it from the Nix binary cache (`out` is its store path).
+    #[default]
+    Nix,
+    /// It was already on this computer (pacman, an AppImage, Steam, a
+    /// launcher entry of the user's): the card stands for its launcher
+    /// entry `entry`. Removing the card hides the app; restoring it shows
+    /// the app again. Nothing is downloaded or uninstalled.
+    System,
+}
+
+impl Source {
+    pub fn is_nix(&self) -> bool {
+        *self == Source::Nix
+    }
+}
+
+/// Prefix of the ids eep gives apps it finds on the computer (`sys-gimp`).
+/// The catalog never uses it, so a found app and an eep app never share an id.
+pub const SYSTEM_PREFIX: &str = "sys-";
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Card {
     pub eep: u32,
@@ -21,10 +45,26 @@ pub struct Card {
     pub name: String,
     #[serde(default)]
     pub kind: Kind,
+    #[serde(default, skip_serializing_if = "Source::is_nix")]
+    pub source: Source,
+    /// Where a found app came from: `pacman`, `appimage`, `steam`,
+    /// `flatpak`, `local` (the user's own entry) or `system` (system cards).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
+    /// The launcher entry's desktop file id, `gimp.desktop` (system cards).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry: Option<String>,
+    /// The pacman package that owns the entry (system cards, when known).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub package: Option<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub channel: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub release: String,
+    #[serde(default)]
     pub version: String,
-    /// The app's store path.
+    /// The app's store path (eep apps).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub out: String,
     /// Main program relative to `out`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -68,6 +108,15 @@ impl Card {
         if !valid_id(&card.id) {
             bail!("card has a bad id {:?}", card.id);
         }
+        if card.source == Source::System {
+            return card.check_system();
+        }
+        if card.id.starts_with(SYSTEM_PREFIX) {
+            bail!(
+                "card id {:?} is reserved for apps found on the computer",
+                card.id
+            );
+        }
         StorePath::from_absolute(&card.out).context("card out")?;
         if let Some(p) = &card.previous {
             StorePath::from_absolute(p).context("card previous")?;
@@ -83,15 +132,7 @@ impl Card {
         {
             bail!("card icon must be inside the store: {i:?}");
         }
-        if let Some(d) = &card.icon_data {
-            let ok_type = matches!(
-                card.icon_type.as_deref(),
-                Some("image/svg+xml" | "image/png")
-            );
-            if !ok_type || d.len() > ICON_MAX * 4 / 3 + 4 {
-                bail!("card icon must be an SVG or PNG of at most {ICON_MAX} bytes");
-            }
-        }
+        card.check_icon()?;
         if card
             .bin
             .iter()
@@ -100,6 +141,48 @@ impl Card {
             bail!("card bin entries must be plain program names");
         }
         Ok(card)
+    }
+
+    /// A system card names a launcher entry and nothing to fetch or run
+    /// from the store.
+    fn check_system(self) -> Result<Self> {
+        if !self.id.starts_with(SYSTEM_PREFIX) {
+            bail!(
+                "a card for an app found on the computer needs an id starting with {SYSTEM_PREFIX:?}"
+            );
+        }
+        let entry = self.entry.as_deref().unwrap_or_default();
+        if !valid_entry(entry) {
+            bail!("card has a bad launcher entry {entry:?}");
+        }
+        if !self.out.is_empty()
+            || self.exec.is_some()
+            || self.desktop.is_some()
+            || self.icon.is_some()
+            || !self.bin.is_empty()
+            || self.previous.is_some()
+        {
+            bail!("a card for an app found on the computer names no store paths");
+        }
+        self.check_icon()?;
+        Ok(self)
+    }
+
+    fn check_icon(&self) -> Result<()> {
+        if let Some(d) = &self.icon_data {
+            let ok_type = matches!(
+                self.icon_type.as_deref(),
+                Some("image/svg+xml" | "image/png")
+            );
+            if !ok_type || d.len() > ICON_MAX * 4 / 3 + 4 {
+                bail!("card icon must be an SVG or PNG of at most {ICON_MAX} bytes");
+            }
+        }
+        Ok(())
+    }
+
+    pub fn is_system(&self) -> bool {
+        self.source == Source::System
     }
 
     pub fn to_toml(&self) -> String {
@@ -134,8 +217,18 @@ impl Card {
     }
 }
 
+/// A desktop file id: `gimp.desktop`, `Dota 2.desktop` — one file name,
+/// never a path.
+pub fn valid_entry(entry: &str) -> bool {
+    entry.len() > ".desktop".len()
+        && entry.len() <= 255
+        && entry.ends_with(".desktop")
+        && !entry.starts_with('.')
+        && !entry.contains(['/', '\0', '\n', '\r'])
+}
+
 /// A relative path that can't climb out of its base.
-fn inside(rel: &str) -> bool {
+pub fn inside(rel: &str) -> bool {
     !rel.is_empty() && !rel.starts_with('/') && !rel.split('/').any(|c| c == "..")
 }
 
@@ -187,6 +280,10 @@ mod tests {
             id: "firefox".into(),
             name: "Firefox".into(),
             kind: Kind::Gui,
+            source: Default::default(),
+            from: None,
+            entry: None,
+            package: None,
             channel: "nixos-unstable".into(),
             release: "nixos-26.11pre1125864.2786a2a72088".into(),
             version: "160.0.1".into(),
@@ -246,6 +343,34 @@ mod tests {
         let mut odd = card();
         odd.embed_icon("x.xpm", b"x");
         assert!(odd.icon_data.is_none());
+    }
+
+    #[test]
+    fn system_cards() {
+        let text = "eep = 0\nid = \"sys-gimp\"\nname = \"GIMP\"\nsource = \"system\"\n\
+                    from = \"pacman\"\nentry = \"gimp.desktop\"\npackage = \"gimp\"\n\
+                    version = \"3.2.8-1\"\ninstalled = 2026-11-23T10:00:00Z\n";
+        let c = Card::parse(text).expect("parses");
+        assert!(c.is_system());
+        assert_eq!(Card::parse(&c.to_toml()).expect("roundtrip"), c);
+        assert!(
+            !c.to_toml().contains("out ="),
+            "no store fields: {}",
+            c.to_toml()
+        );
+        // a path for an entry, a store path, or an eep id: refused
+        for bad in [
+            text.replace("gimp.desktop", "../../.bashrc.desktop"),
+            text.replace("gimp.desktop", "gimp"),
+            format!("{text}out = \"/nix/store/yp5wq7w4b8ym5svs1fa8b5qnvn9wa9rk-gimp-3\"\n"),
+            text.replace("sys-gimp", "gimp"),
+        ] {
+            assert!(Card::parse(&bad).is_err(), "{bad}");
+        }
+        // an eep card can't take a found app's id
+        let mut nix = card();
+        nix.id = "sys-firefox".into();
+        assert!(Card::parse(&nix.to_toml()).is_err());
     }
 
     #[test]

@@ -44,8 +44,9 @@ post_install() {
     # every desktop user: the ~/Applications watcher and the update check
     _q systemctl --global enable eep-watch.service eep-updates.timer
     _q update-mime-database /usr/share/mime
-    echo ":: eep is installed. Apps go into ~/Applications (eep install <app>, or a"
-    echo "   card from Komble or the website). The graphics driver for them is being"
+    echo ":: eep is installed. Every app now has a card in ~/Applications (after the"
+    echo "   next login); more come from Komble or the website. Move a card to the"
+    echo "   Trash to remove an app, restore it to bring it back. The graphics driver for them is being"
     echo "   set up now: systemctl status eep-driver.service"
     echo "   Log out and back in once (or: systemctl --user start eep-watch.service)."
 }
