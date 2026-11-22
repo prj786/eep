@@ -43,6 +43,15 @@ eep-build publish --release <R>          # dist/channels/nixos-unstable.json →
 python3 -m http.server -d dist 8000      # the VM sees it at http://10.0.2.2:8000
 ```
 
+The public server is **<https://prj786.github.io/eep>** (eep's default):
+GitHub Pages of this repo, from a `gh-pages` branch that is one orphan
+commit replaced on every publish, so patch files never pile up in history.
+`.github/workflows/publish-index.yml` rebuilds it every day (newest
+nixos-unstable release, its cards, patches from the previous one) and
+keeps the newest few releases. A client uses another server with
+`server = "…"` in `~/.config/eep/config.toml` (or `/etc/eep/config.toml`)
+or `EEP_SERVER`.
+
 Caches live in `~/.cache/eep-build` (narinfos, listings and evals forever;
 NARs for patch building, safe to delete). Indexes are deterministic: the
 same release and catalog give byte-identical output.

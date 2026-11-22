@@ -11,9 +11,11 @@ use sha2::Digest;
 
 use crate::paths::{Paths, write_atomic};
 
-/// Prototype default: the builder's `dist/` served from the host, as the
-/// ewe VM sees it through QEMU user networking.
-pub const DEFAULT_SERVER: &str = "http://10.0.2.2:8000";
+/// The public eep server: the builder's `dist/`, published to GitHub Pages
+/// (the `gh-pages` branch of prj786/eep, see `publish-index.yml`). A local
+/// `dist/` (the VM, the test container) is set with `server =` in
+/// config.toml or `EEP_SERVER`.
+pub const DEFAULT_SERVER: &str = "https://prj786.github.io/eep";
 pub const DEFAULT_CHANNEL: &str = "nixos-unstable";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
