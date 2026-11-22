@@ -1,0 +1,156 @@
+# The public eep server: https://prj786.github.io/eep (GitHub Pages of this
+# repo, from the `gh-pages` branch). Every run:
+#
+#   1. takes what is published now (the gh-pages branch, as dist/),
+#   2. finds the newest nixos-unstable release (`eep-build releases`),
+#   3. builds its index (one Nix eval, native Nix) and its cards,
+#   4. builds update patches from the release published so far,
+#   5. points channels/nixos-unstable.json at it (`eep-build publish`),
+#   6. keeps only the newest $KEEP releases and the patch sets between them,
+#   7. replaces gh-pages with ONE orphan commit (force push), so patch files
+#      (tens of MB each) never pile up in the repo's history.
+#
+# Nothing changed (same release, same catalog: indexes are byte-identical
+# on a rebuild) → nothing is pushed.
+name: publish-index
+
+on:
+  schedule:
+    - cron: "23 5 * * *"   # daily; nixos-unstable moves every one to three days
+  workflow_dispatch:
+    inputs:
+      release:
+        description: "Release to publish (default: the newest nixos-unstable)"
+        required: false
+      from:
+        description: "Release to build patches from (default: the one published now)"
+        required: false
+
+permissions:
+  contents: write
+  pages: write
+
+# Never two publishes at once, and never one killed between commit and push.
+concurrency:
+  group: publish-index
+  cancel-in-progress: false
+
+env:
+  CHANNEL: nixos-unstable
+  KEEP: 3
+  CARGO_TERM_COLOR: always
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check out what is published now (gh-pages → dist/)
+        uses: actions/checkout@v4
+        with:
+          ref: gh-pages
+          path: dist
+
+      - uses: cachix/install-nix-action@v31
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # narinfos, file listings and evals never change for a store path or a
+      # release: keep them between runs. NARs (patch building) are too big.
+      - name: Restore the builder cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/eep-build/narinfo
+            ~/.cache/eep-build/ls
+            ~/.cache/eep-build/files
+            ~/.cache/eep-build/eval
+          key: eep-build-${{ github.run_id }}
+          restore-keys: eep-build-
+
+      - name: Build eep-build
+        run: cargo build --release --locked -p eep-build
+
+      - name: Build the index, cards, patches and pointer
+        id: build
+        env:
+          WANT_RELEASE: ${{ inputs.release }}
+          WANT_FROM: ${{ inputs.from }}
+        run: |
+          set -euo pipefail
+          b=target/release/eep-build
+          # Every eep-build command prints one JSON object and exits 0: the
+          # "ok" field is the result.
+          step() {
+            local out
+            out="$("$b" "$@")"
+            echo "$out" | jq -c 'del(.pieces, .apps, .patches)' >&2
+            echo "$out" | jq -e '.ok == true' >/dev/null || { echo "::error::eep-build $1 failed"; exit 1; }
+            echo "$out"
+          }
+          new="$WANT_RELEASE"
+          if [ -z "$new" ]; then
+            new="$(step releases --channel "$CHANNEL" --count 1 | jq -r '.releases[-1].release')"
+          fi
+          ptr="dist/channels/$CHANNEL.json"
+          prev="$WANT_FROM"
+          if [ -z "$prev" ] && [ -f "$ptr" ]; then prev="$(jq -r .release "$ptr")"; fi
+          echo "newest: $new, published: ${prev:-none}"
+          echo "release=$new" >> "$GITHUB_OUTPUT"
+
+          step index --release "$new" --channel "$CHANNEL" --nix native > /dev/null
+          step cards --release "$new" > /dev/null
+          if [ -n "$prev" ] && [ "$prev" != "$new" ] && [ -f "dist/$prev/index.json" ]; then
+            # 2 at once: patch building peaked at 11.6 GB with 4 (a 1 GB piece
+            # with a 2 GB window); the runner has 16 GB. No patches only
+            # means full downloads: publish the index anyway.
+            ( step patches --from "$prev" --to "$new" --threads 2 > /dev/null ) \
+              || { echo "::warning::no patches $prev → $new"; rm -rf "dist/patches/${prev}__${new}"; }
+          fi
+          step publish --release "$new" > /dev/null
+
+          # Keep the newest $KEEP releases (by publication time) and only the
+          # patch sets between two kept releases.
+          mapfile -t keep < <(for d in dist/nixos-*/; do
+              d="${d%/}"; [ -f "$d/index.json" ] || continue
+              printf '%s %s\n' "$(jq -r .released "$d/index.json")" "${d#dist/}"
+            done | sort | tail -n "$KEEP" | awk '{print $2}')
+          echo "keeping: ${keep[*]}"
+          kept() { local r; for r in "${keep[@]}"; do [ "$r" = "$1" ] && return 0; done; return 1; }
+          kept "$new" || { echo "::error::$new is not among the kept releases"; exit 1; }
+          for d in dist/nixos-*/; do
+            r="$(basename "$d")"; kept "$r" || { echo "drop $r"; rm -rf "$d"; }
+          done
+          for d in dist/patches/*__*/; do
+            [ -d "$d" ] || continue
+            s="$(basename "$d")"
+            if ! kept "${s%%__*}" || ! kept "${s##*__}"; then echo "drop patches $s"; rm -rf "$d"; fi
+          done
+          touch dist/.nojekyll
+          # Pages refuses files over 100 MB.
+          big="$(find dist -path dist/.git -prune -o -type f -size +99M -print)"
+          [ -z "$big" ] || { echo "::error::over 100 MB: $big"; exit 1; }
+          du -sh --exclude=.git dist
+
+      - name: Replace gh-pages with one orphan commit
+        env:
+          RELEASE: ${{ steps.build.outputs.release }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          cd dist
+          git config user.name "github-actions[bot]"
+          git config user.email "41898+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "nothing changed: $RELEASE is published already"
+            exit 0
+          fi
+          git checkout -q --orphan publish
+          git commit -q -m "eep server data: $CHANNEL → $RELEASE"
+          git push --force origin publish:gh-pages
+          # A push by GITHUB_TOKEN builds Pages; ask once more in case not.
+          gh api -X POST "repos/$GITHUB_REPOSITORY/pages/builds" >/dev/null 2>&1 || true
+          echo "published $RELEASE"
