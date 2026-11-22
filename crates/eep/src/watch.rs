@@ -30,10 +30,38 @@ pub fn watch(ctx: &Ctx) -> Result<Value> {
         | WatchMask::MOVED_TO
         | WatchMask::DELETE_SELF
         | WatchMask::MOVE_SELF;
-    std::fs::create_dir_all(apps)?;
-    ino.watches()
-        .add(apps, mask)
-        .with_context(|| format!("watching {}", apps.display()))?;
+    // ~/Applications is made on the first run only. Later, a missing one
+    // was moved or renamed by the user: wait for it to come back (watching
+    // its parent) instead of making an empty one, which would block the
+    // move back and say "no apps".
+    if !apps.exists() && first_run(&ctx.p) {
+        std::fs::create_dir_all(apps)?;
+    }
+    let apps_name = apps.file_name().map(ToOwned::to_owned);
+    let parent_mask = WatchMask::CREATE | WatchMask::MOVED_TO | WatchMask::ONLYDIR;
+    let mut waiting: Option<inotify::WatchDescriptor> = None;
+    if apps.is_dir() {
+        ino.watches()
+            .add(apps, mask)
+            .with_context(|| format!("watching {}", apps.display()))?;
+    } else if let Some(parent) = apps.parent() {
+        waiting = ino.watches().add(parent, parent_mask).ok();
+    }
+    // The launcher entries of every app: a package installed or removed,
+    // an AppImage added — its card follows. (Folders that don't exist yet,
+    // like an unused /usr/local/share/applications, are not watched.)
+    let dirs = crate::system::Dirs::from_env(&ctx.p);
+    let _ = std::fs::create_dir_all(&dirs.user);
+    let entry_mask = WatchMask::CREATE
+        | WatchMask::CLOSE_WRITE
+        | WatchMask::DELETE
+        | WatchMask::MOVED_FROM
+        | WatchMask::MOVED_TO;
+    let entry_wds: Vec<inotify::WatchDescriptor> = dirs
+        .apps_dirs()
+        .iter()
+        .filter_map(|d| ino.watches().add(d, entry_mask).ok())
+        .collect();
     // eep itself: when its file is replaced (an update), the watcher would
     // go on running the old code — it restarts as the new eep instead.
     let exe = std::env::current_exe().ok();
@@ -49,10 +77,15 @@ pub fn watch(ctx: &Ctx) -> Result<Value> {
     report(ops::reconcile(ctx, false));
     let mut buf = [0u8; 8192];
     let mut seen = Seen::default();
-    let me = (exe_wd.as_ref(), exe_name.as_deref());
+    let me = Me {
+        exe_wd: exe_wd.as_ref(),
+        exe_name: exe_name.as_deref(),
+        entry_wds: &entry_wds,
+    };
     loop {
         for e in ino.read_events_blocking(&mut buf)? {
-            seen.take(&e, me);
+            seen.take(&e, &me, waiting.as_ref());
+            seen.back |= is_back(&e, waiting.as_ref(), apps_name.as_deref());
         }
         let mut quiet = Duration::ZERO;
         while quiet < DEBOUNCE {
@@ -62,7 +95,8 @@ pub fn watch(ctx: &Ctx) -> Result<Value> {
                     let mut any = false;
                     for e in events {
                         any = true;
-                        seen.take(&e, me);
+                        seen.take(&e, &me, waiting.as_ref());
+                        seen.back |= is_back(&e, waiting.as_ref(), apps_name.as_deref());
                     }
                     quiet = if any { Duration::ZERO } else { quiet + TICK };
                 }
@@ -77,9 +111,18 @@ pub fn watch(ctx: &Ctx) -> Result<Value> {
             let err = std::process::Command::new(exe).arg("watch").exec();
             eprintln!("eep: restarting as the new eep failed ({err}); going on");
         }
-        if std::mem::take(&mut seen.lost_dir) {
-            // ~/Applications itself went away: recreate it and watch the new one.
-            std::fs::create_dir_all(apps)?;
+        if std::mem::take(&mut seen.lost_dir) && waiting.is_none() {
+            // ~/Applications went away (moved, renamed): change nothing, wait
+            // for it to come back.
+            seen.relevant = false;
+            if let Some(parent) = apps.parent() {
+                waiting = ino.watches().add(parent, parent_mask).ok();
+            }
+        }
+        if std::mem::take(&mut seen.back) && apps.is_dir() {
+            if let Some(wd) = waiting.take() {
+                let _ = ino.watches().remove(wd);
+            }
             ino.watches().add(apps, mask)?;
             seen.relevant = true;
         }
@@ -89,6 +132,14 @@ pub fn watch(ctx: &Ctx) -> Result<Value> {
     }
 }
 
+/// The watches that aren't `~/Applications`.
+struct Me<'a> {
+    exe_wd: Option<&'a inotify::WatchDescriptor>,
+    exe_name: Option<&'a std::ffi::OsStr>,
+    /// The applications folders (launcher entries).
+    entry_wds: &'a [inotify::WatchDescriptor],
+}
+
 /// What a batch of inotify events asked for.
 #[derive(Debug, Default)]
 struct Seen {
@@ -96,6 +147,8 @@ struct Seen {
     relevant: bool,
     /// ~/Applications itself was removed or moved.
     lost_dir: bool,
+    /// ~/Applications appeared again (made, or moved back).
+    back: bool,
     /// eep's own file was replaced.
     upgraded: bool,
 }
@@ -104,10 +157,22 @@ impl Seen {
     fn take(
         &mut self,
         e: &inotify::Event<&std::ffi::OsStr>,
-        (exe_wd, exe_name): (Option<&inotify::WatchDescriptor>, Option<&std::ffi::OsStr>),
+        me: &Me<'_>,
+        waiting: Option<&inotify::WatchDescriptor>,
     ) {
-        if Some(&e.wd) == exe_wd {
-            self.upgraded |= e.name.is_some_and(|n| Some(n) == exe_name);
+        if Some(&e.wd) == me.exe_wd {
+            self.upgraded |= e.name.is_some_and(|n| Some(n) == me.exe_name);
+            return;
+        }
+        if waiting.is_some_and(|w| *w == e.wd) {
+            return; // the parent, while waiting for ~/Applications (is_back)
+        }
+        if me.entry_wds.contains(&e.wd) {
+            // a launcher entry (not eep's temp files, not mimeinfo.cache)
+            self.relevant |= e.name.is_some_and(|n| {
+                let n = n.to_string_lossy();
+                n.ends_with(".desktop") && !n.starts_with('.')
+            });
             return;
         }
         self.relevant |= e.name.is_none_or(|n| is_card_name(&n.to_string_lossy()));
@@ -115,6 +180,20 @@ impl Seen {
             .mask
             .intersects(inotify::EventMask::DELETE_SELF | inotify::EventMask::MOVE_SELF);
     }
+}
+
+/// An event in the parent while waiting for ~/Applications: is it the folder?
+fn is_back(
+    e: &inotify::Event<&std::ffi::OsStr>,
+    waiting: Option<&inotify::WatchDescriptor>,
+    apps_name: Option<&std::ffi::OsStr>,
+) -> bool {
+    waiting.is_some_and(|w| *w == e.wd) && e.name.is_some() && e.name == apps_name
+}
+
+/// Nothing installed or found yet: making ~/Applications can't hide a move.
+fn first_run(p: &crate::paths::Paths) -> bool {
+    crate::integrate::known_ids(p).is_empty() && !p.state_dir().join("found.json").exists()
 }
 
 fn is_card_name(n: &str) -> bool {
@@ -125,7 +204,10 @@ fn report(r: Result<Value>) {
     let v = r.unwrap_or_else(|e| json!({ "ok": false, "error": format!("{e:#}") }));
     let quiet = v["ok"] == true
         && v["apps"].as_array().is_some_and(Vec::is_empty)
-        && v["forgotten"].as_array().is_some_and(Vec::is_empty);
+        && v["forgotten"].as_array().is_some_and(Vec::is_empty)
+        && v["found"]
+            .as_object()
+            .is_some_and(serde_json::Map::is_empty);
     if !quiet {
         println!("{v}");
     }
@@ -139,11 +221,29 @@ pub fn open(ctx: &Ctx, file: &Path) -> Result<Value> {
     let card = Card::parse(&text)?;
     let inside = file.parent().is_some_and(|d| same_dir(d, &ctx.p.apps));
     if !inside && cards::find(&ctx.p, &card.id).is_none() {
-        cards::save(&ctx.p, &card, None)?;
+        if card.is_system() {
+            // another computer's app: only if this one has it too
+            cards::save(&ctx.p, &card, None)?;
+        } else {
+            // A card from elsewhere (a download) is not trusted: the app
+            // is installed as the index has it today, never from the store
+            // paths the file names. The index card lands in Applications.
+            let r = ops::install(ctx, std::slice::from_ref(&card.id), ops::Fetch::default())?;
+            if r["ok"] != true {
+                return Ok(r);
+            }
+        }
     }
     let r = ops::reconcile(ctx, false)?;
     if r["ok"] != true {
         return Ok(r);
+    }
+    if card.is_system() && cards::find(&ctx.p, &card.id).is_none() {
+        // a card for an app this computer doesn't have: nothing to start
+        bail!(
+            "{} is not on this computer (it came from another one)",
+            card.name
+        );
     }
     run::run(&ctx.p, &card.id, None, &[], &[])?;
     bail!("exec returned")

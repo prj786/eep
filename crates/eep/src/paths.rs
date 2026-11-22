@@ -66,6 +66,19 @@ impl Paths {
     pub fn index_file(&self) -> PathBuf {
         self.cache.join("index.json")
     }
+
+    /// `~/.local/state/eep`: the lock, the crash journal, `found.json`.
+    pub fn state_dir(&self) -> PathBuf {
+        self.roots
+            .parent()
+            .map_or_else(|| self.roots.clone(), Path::to_path_buf)
+    }
+
+    /// `~/.local/share/eep/hidden`: the user's own launcher entries of
+    /// hidden apps, put back when the card comes back.
+    pub fn hidden(&self) -> PathBuf {
+        self.data.join("hidden")
+    }
 }
 
 fn env_path(var: &str) -> Option<PathBuf> {

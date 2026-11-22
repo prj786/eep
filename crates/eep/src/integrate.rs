@@ -26,6 +26,9 @@ pub struct Integrated {
 }
 
 pub fn integrate(p: &Paths, card: &Card, eep: &Path) -> Result<Integrated> {
+    if !eep_core::valid_id(&card.id) {
+        anyhow::bail!("refusing a bad app id {:?}", card.id);
+    }
     let out = PathBuf::from(&card.out);
     let mut done = Integrated::default();
 
@@ -140,6 +143,9 @@ pub fn shim_owner(p: &Paths, prog: &str) -> Option<String> {
 /// Undo [`integrate`] and drop the app's GC roots. The pieces stay in the
 /// store until `eep gc`, so a card restored from Trash comes back instantly.
 pub fn forget(p: &Paths, id: &str) -> Result<serde_json::Value> {
+    if !eep_core::valid_id(id) {
+        anyhow::bail!("refusing a bad app id {id:?}");
+    }
     let launchers = delete_launchers(p, id)?;
     if launchers > 0 {
         refresh_desktop_database(&p.launchers);
@@ -257,6 +263,9 @@ fn launcher_path(p: &Paths, id: &str, name: &str) -> PathBuf {
 /// Delete this app's shims (and ones from before the two-level layout,
 /// which pointed straight into the app's GC root).
 fn delete_shims(p: &Paths, id: &str) -> Result<usize> {
+    if !eep_core::valid_id(id) {
+        anyhow::bail!("refusing a bad app id {id:?}");
+    }
     let root = p.root(id);
     let mut n = 0;
     if let Ok(rd) = std::fs::read_dir(p.bin()) {
@@ -293,7 +302,7 @@ fn delete_where(dir: &Path, matches: impl Fn(&str) -> bool) -> Result<usize> {
 }
 
 /// MIME associations (`MimeType=`) need the cache rebuilt; best effort.
-fn refresh_desktop_database(dir: &Path) {
+pub(crate) fn refresh_desktop_database(dir: &Path) {
     let _ = std::process::Command::new("update-desktop-database")
         .arg(dir)
         .stdout(std::process::Stdio::null())
@@ -314,6 +323,10 @@ mod tests {
             id: "gimp".into(),
             name: "GIMP".into(),
             kind: Kind::Gui,
+            source: Default::default(),
+            from: None,
+            entry: None,
+            package: None,
             channel: "c".into(),
             release: "r".into(),
             version: "3".into(),

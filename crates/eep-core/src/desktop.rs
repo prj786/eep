@@ -97,6 +97,35 @@ pub fn quote_arg(arg: &str) -> String {
     q
 }
 
+/// Set `keys` in `[Desktop Entry]` (replacing values it already has), and
+/// keep every other line as it is. Line ends come out as `\n` (a CRLF file
+/// is read by no one but GIO otherwise: Quickshell drops "[Desktop Entry]\r").
+pub fn set_keys(text: &str, keys: &[(&str, &str)]) -> String {
+    let mut out = String::with_capacity(text.len() + 64);
+    let mut in_main = false;
+    for line in text.lines() {
+        let t = line.trim();
+        if t.starts_with('[') {
+            in_main = t == "[Desktop Entry]";
+            out.push_str(t);
+            out.push('\n');
+            if in_main {
+                for (k, v) in keys {
+                    out.push_str(&format!("{k}={v}\n"));
+                }
+            }
+            continue;
+        }
+        let key = t.split_once('=').map(|(k, _)| k.trim());
+        if in_main && key.is_some_and(|k| keys.iter().any(|(x, _)| *x == k)) {
+            continue;
+        }
+        out.push_str(line.trim_end_matches('\r'));
+        out.push('\n');
+    }
+    out
+}
+
 /// Rewrite a desktop file for eep:
 /// - every `Exec=` (all groups, actions included) goes through `exec`
 /// - `[Desktop Entry]` gets `Icon=<icon>` (when given) and `X-Eep-Id=<id>`
@@ -138,6 +167,16 @@ pub fn rewrite(text: &str, id: &str, icon: Option<&str>, exec: impl Fn(&str) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn keys_are_set_in_the_main_group_only() {
+        let text = "[Desktop Entry]\r\nName=A\r\nNoDisplay=false\r\n[Desktop Action x]\r\nNoDisplay=false\r\n";
+        let out = set_keys(text, &[("NoDisplay", "true"), ("X-Eep-Hides", "sys-a")]);
+        assert_eq!(
+            out,
+            "[Desktop Entry]\nNoDisplay=true\nX-Eep-Hides=sys-a\nName=A\n[Desktop Action x]\nNoDisplay=false\n"
+        );
+    }
 
     const FF: &str = "[Desktop Entry]
 Actions=new-private-window;new-window

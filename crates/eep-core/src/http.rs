@@ -65,6 +65,9 @@ impl Http {
                 .ip_family(ip_family())
                 .timeout_connect(Some(Duration::from_secs(20)))
                 .timeout_recv_response(Some(Duration::from_secs(60)))
+                // a stalled body must not hold eep's lock forever (the
+                // biggest piece is ~1 GB: generous even on a slow link)
+                .timeout_recv_body(Some(Duration::from_secs(45 * 60)))
                 .build()
                 .into()
         })

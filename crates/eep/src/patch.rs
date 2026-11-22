@@ -102,11 +102,11 @@ pub fn apply(p: &Paths, c: &Candidates, verify: bool) -> Result<Applied> {
     if !local.join("nix-cache-info").is_file() {
         bail!("{} is not set up (see vm/setup-guest.sh)", local.display());
     }
-    work_dir()?;
+    let work = work_dir()?;
     let jobs: Vec<(&String, &(String, Patch))> = c.by_piece.iter().collect();
     let http = Http::new();
     let results = par_map(&jobs, PARALLEL, |(piece, (dir, patch))| {
-        let r = apply_one(&http, local, piece, dir, patch, verify);
+        let r = apply_one(&http, local, &work, piece, dir, patch, verify);
         if let Err(e) = &r {
             eprintln!("eep: patch for {piece} not used: {e:#}");
         }
@@ -128,22 +128,35 @@ pub fn apply(p: &Paths, c: &Candidates, verify: bool) -> Result<Applied> {
 }
 
 /// Scratch space for base NARs (up to a GB each: not /tmp, often RAM).
-/// Shared like /var/tmp itself — every user and root's driver timer patch
-/// here — so whoever creates it makes it sticky and world-writable (the
-/// package's tmpfiles rule does the same).
-fn work_dir() -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    let w = Path::new(WORK);
-    if !w.is_dir() {
-        std::fs::create_dir_all(w).with_context(|| format!("mkdir {WORK}"))?;
-        let _ = std::fs::set_permissions(w, std::fs::Permissions::from_mode(0o1777));
+/// `/var/tmp/eep` is shared like /var/tmp itself (sticky, world-writable;
+/// the package's tmpfiles rule makes it), and every user — root's driver
+/// timer too — works in a private `<uid>` folder inside it, so nobody can
+/// plant a file or a link where another one writes.
+fn work_dir() -> Result<PathBuf> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+    let shared = Path::new(WORK);
+    if !shared.is_dir() {
+        std::fs::create_dir_all(shared).with_context(|| format!("mkdir {WORK}"))?;
+        let _ = std::fs::set_permissions(shared, std::fs::Permissions::from_mode(0o1777));
     }
-    Ok(())
+    let uid = std::fs::metadata("/proc/self").map(|m| m.uid())?;
+    let mine = shared.join(uid.to_string());
+    match std::fs::DirBuilder::new().mode(0o700).create(&mine) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(e).with_context(|| format!("mkdir {}", mine.display())),
+    }
+    let m = std::fs::symlink_metadata(&mine)?;
+    if !m.is_dir() || m.uid() != uid || m.mode() & 0o077 != 0 {
+        bail!("{} is not this user's private folder", mine.display());
+    }
+    Ok(mine)
 }
 
 fn apply_one(
     http: &Http,
     local: &Path,
+    work: &Path,
     piece: &str,
     dir: &str,
     patch: &Patch,
@@ -154,11 +167,11 @@ fn apply_one(
     if patch.file.contains("..") || patch.file.starts_with('/') {
         bail!("strange patch path {:?}", patch.file);
     }
-    let work = Path::new(WORK);
     let patch_file = work.join(format!("{}.zst", sp.hash()));
     let base_nar = work.join(format!("{}.base.nar", sp.hash()));
     let nar = local.join("nar").join(format!("{}.nar", sp.hash()));
-    let tmp_nar = nar.with_extension("nar.tmp");
+    // rebuilt in the private folder, checked there, then moved in
+    let tmp_nar = work.join(format!("{}.nar", sp.hash()));
     let result = (|| -> Result<()> {
         let (mut body, _) = http
             .get_reader(&format!("{dir}{}", patch.file))?
@@ -196,7 +209,7 @@ fn apply_one(
                 bail!("rebuilt piece doesn't match its NarHash");
             }
         }
-        std::fs::rename(&tmp_nar, &nar)?;
+        publish_nar(&tmp_nar, &nar)?;
         let mut info = NarInfo::parse(&patch.narinfo)?;
         if info.store_path()? != sp {
             bail!("manifest narinfo is for another piece");
@@ -215,6 +228,35 @@ fn apply_one(
         let _ = std::fs::remove_file(f);
     }
     result.map(|()| vec![nar.clone(), local.join(format!("{}.narinfo", sp.hash()))])
+}
+
+/// Move a checked NAR into the shared local cache: a rename on the same
+/// file system; otherwise a copy into a fresh, exclusively created file
+/// first (never through a name someone else could have planted).
+fn publish_nar(from: &Path, to: &Path) -> Result<()> {
+    if std::fs::rename(from, to).is_ok() {
+        return Ok(());
+    }
+    let dir = to.parent().context("nar dir")?;
+    let tmp = dir.join(format!(
+        ".{}.{}.tmp",
+        to.file_name()
+            .map(|n| n.to_string_lossy())
+            .unwrap_or_default(),
+        std::process::id()
+    ));
+    let mut out = std::fs::File::options()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+        .with_context(|| format!("creating {}", tmp.display()))?;
+    let r = std::io::copy(&mut std::fs::File::open(from)?, &mut out)
+        .and_then(|_| out.sync_all())
+        .and_then(|()| std::fs::rename(&tmp, to));
+    if r.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    r.with_context(|| format!("moving the rebuilt piece to {}", to.display()))
 }
 
 /// Remove what [`apply`] put in the local cache (after the realise).

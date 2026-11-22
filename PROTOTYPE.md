@@ -1,7 +1,7 @@
 # eep — prototype guide
 
 > **eep = ewe executable package.** Prototype plan, written 2026-11-22.
-> Status: **Steps 0–6 done** (2026-11-22), in containers and the ewe VM;
+> Status: **0.2.0-beta** (2026-11-22): every app a card. Steps 0–6 done, in containers and the ewe VM;
 > every go/no-go row passes (`bench/RESULTS.md`). Waiting on the owner:
 > go/no-go (then RFC-010), B11 (real GPU), the GitHub repo. See **§13**.
 > Read this once from top to bottom. Then work through the steps in order;
@@ -533,6 +533,13 @@ Record it honestly.
 31. **A running watcher keeps the old eep after an update.** `eep watch` now watches its own binary and re-execs itself when the file is replaced (same PID, new code). Earlier, an old watcher removed launchers by the old naming and left the new ones behind.
 32. **The old naming rule deleted `eep-open.desktop`** (the card handler) as the leftovers of an app called "open". Ownership is now only by `X-Eep-Id`; files without it are never eep's.
 
+33. **Hide a found app with `NoDisplay=true`, never `Hidden=true`.** `Hidden` means "deleted" to GIO too: a hidden ewe Files would stop opening folders (inode/directory) and every MIME default naming it would break. eep's hiding copy keeps the whole entry plus `NoDisplay=true` and `X-Eep-Hides=<id>`, and eep only ever replaces or deletes an entry carrying its own mark.
+34. **A desktop file in `~/.local/share/applications` replaces the system one entirely** (same desktop id). The hiding copy is therefore the full entry, not a stub; when pacman updates the system entry, eep refreshes its copy (newer mtime). A user-level entry (Steam's, Komble's, the user's own) is first copied byte for byte to `~/.local/share/eep/hidden/` and comes back from there.
+35. **Icon themes are huge** (Reversal: 208,000 files). Find icons the spec's way: `index.theme` → `Directories` + `Inherits`, then a `stat` per folder; never walk a theme. Icons above 96 KB (Zed ships only a 168 KB 512 px PNG) go through `magick` to 256 px.
+36. **Komble's AppImage entries can name a `TryExec` that no longer exists** (a `.komble-run/<id>` link to a missing folder): GIO hides such an entry, and so does eep (no card). The AppImage would not start anyway.
+37. **A broken card or a moved `~/Applications` must change nothing.** Forgetting (eep apps) and hiding (found apps) run only after a *sure* listing: the folder was read and every card's id is known (a card that doesn't parse keeps its id through a lenient TOML read). The watcher never recreates a moved `~/Applications` (it waits on the parent for it to come back); it makes the folder only on the very first run.
+38. **Index fields are network input, and root reads them** (the driver timer). `Index::validate` runs on every fetch and load (and in `eep-build` before publishing): plain names for release/channel/ids, store paths for out/closure/driver, `inside()` for exec/desktop/icon, plain program names for `bin`. Fable's review found `release = "/etc/cron.d"` and `eep remove '../..'` reaching outside eep's folders before this.
+
 ## 11. Reference
 
 ```sh
@@ -738,3 +745,52 @@ checklist incl. GL through `/run/opengl-driver`, launcher pick-up,
 update); the full 8-app A → B update in the VM (Step 4 done-when); Step 6
 benchmarks B1–B4, B6–B8, B10; owner gates (GitHub repo for CI, B11, go/no-go).
 
+
+### 2026-11-22 (late): every app a card, 0.2.0-beta
+
+Owner: "every single package will be an eep file even default ewe
+applications. also the apps i am currently using … use fable to check code
+for eep and otherwise extend it with opus." And: GIMP's card opened as a
+file manager — on the owner's machine eep wasn't installed, so the card was
+a plain text file to everything (launcher → xdg-open, Files → GIO default).
+
+- **Found apps** (`crates/eep/src/system.rs`): every visible launcher entry
+  (`$XDG_DATA_HOME` + `$XDG_DATA_DIRS`, precedence, NoDisplay/Hidden/
+  TryExec; NOT OnlyShowIn — ewe's launcher shows those entries, so they
+  get cards too) gets a `source = "system"` card,
+  id `sys-<desktop id>`, with `from` (pacman/appimage/steam/flatpak/local),
+  pacman's package and version (one `pacman -Qo` for all), and its icon.
+  Card leaves → the app is hidden (gotchas 33–34); card back → shown;
+  uninstalled → the card goes; an eep app with the same desktop id → the
+  found card goes. `found.json` remembers what was found (rebuilt from the
+  marks if lost). The watcher also follows the applications folders.
+  Owner's machine in a sandbox HOME: 61 apps, 59 with icons, 0.6 s first
+  pass (with one `magick` resize), then ~10 ms.
+- **Fable's review** (13 findings, all verified) fixed: index/pointer/
+  config validation incl. root's driver timer (gotcha 38); ids checked at
+  every entry point and in `integrate`/`forget`; index cards round-trip
+  through `Card::parse`; a bad card or a moved folder never uninstalls
+  (gotcha 37); `eep open` of a downloaded card installs what the *index*
+  says, never the file's store paths; clap errors and panics are JSON
+  (exit 0); a 45-minute body timeout and a "waiting for another eep" note;
+  stale `.batch-`/`.trash-` roots cleaned; `eep remove` deletes every copy
+  of a card; patch scratch space is a private `/var/tmp/eep/<uid>` (0700)
+  and NARs enter the shared cache by rename or an exclusive temp file;
+  rollback keeps a card's version when it has no previous one; the gc
+  caveat is in the README.
+- **Catalog 10 → 43 apps**: the owner's free apps (Brave, Zed, OBS,
+  Nextcloud, mpv, Zathura, Volume Control, Galculator, guvcview, Heroic,
+  Bottles) and popular ones (Thunderbird, Chromium, Inkscape, Krita,
+  Blender, Audacity, Kdenlive, Shotcut, darktable, HandBrake, Signal,
+  Element, KeePassXC, qBittorrent, Celluloid, Foliate, Text Editor; btop,
+  fd, bat, eza, yt-dlp). All 43 evaluate on 2786a2a72088; every pinned
+  launcher entry checked against the cache's `.ls` (Audacity's is
+  `org.audacityteam.Audacity.desktop`; Chromium, Bottles and Heroic link
+  `share/applications` into their unwrapped piece, which the builder
+  follows). Thunderbird 160.0 was not in the cache yet: unavailable until
+  Hydra has it. `eval.nix` now survives a throwing alias (one app
+  unavailable, not the release).
+- Container: `e2e.sh` 16/16 and `update.sh` (patched A → B 61 MB instead
+  of 152 MB, verify, rollback, tamper) pass on the new code.
+- ewe 0.49 depends on eep; its launcher leaves cards in ~/Applications out
+  of file results; ewe Files 0.3.1 says "update ewe" for a card without eep.

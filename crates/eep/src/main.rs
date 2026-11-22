@@ -17,6 +17,7 @@ mod patch;
 mod paths;
 mod run;
 mod state;
+mod system;
 mod watch;
 
 use std::ffi::OsString;
@@ -48,8 +49,13 @@ enum Cmd {
     /// One app from the index: versions, sizes, what a download would cost now.
     Info { id: String },
     /// Installed apps (the cards).
-    List,
-    /// Install apps: fetch, add to the launcher, write the card.
+    List {
+        /// Also the apps found on the computer (pacman, AppImages, Steam…).
+        #[arg(long)]
+        all: bool,
+    },
+    /// Install apps: fetch, add to the launcher, write the card. A found
+    /// app's id (`sys-…`) brings its card back and shows it again.
     Install {
         #[arg(required = true)]
         ids: Vec<String>,
@@ -57,6 +63,7 @@ enum Cmd {
         fetch: FetchArgs,
     },
     /// Remove apps (card, launcher entry, roots). Disk is freed by `eep gc`.
+    /// A found app (`sys-…`) is hidden, not uninstalled.
     Remove {
         #[arg(required = true)]
         ids: Vec<String>,
@@ -151,10 +158,44 @@ fn main() {
     if let Some(prog) = invoked_as() {
         shim(&prog);
     }
-    let cli = Cli::parse();
-    let out =
-        dispatch(cli.cmd).unwrap_or_else(|e| json!({ "ok": false, "error": format!("{e:#}") }));
+    // Rule 5 holds for a mistyped command too: help and --version print as
+    // usual, every other parse error is one JSON line, exit 0.
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(e) => {
+            use clap::error::ErrorKind;
+            if matches!(e.kind(), ErrorKind::DisplayHelp | ErrorKind::DisplayVersion) {
+                let _ = e.print();
+                return;
+            }
+            // clap's first paragraph ("error: … not provided:\n  <IDS>..."), one line
+            let msg = e.render().to_string();
+            let words: Vec<&str> = msg
+                .lines()
+                .take_while(|l| !l.trim().is_empty())
+                .map(str::trim)
+                .collect();
+            let text = words.join(" ");
+            let text = text.strip_prefix("error: ").unwrap_or(&text);
+            println!("{}", json!({ "ok": false, "error": text }));
+            return;
+        }
+    };
+    let out = std::panic::catch_unwind(|| dispatch(cli.cmd))
+        .unwrap_or_else(|_| Err(anyhow::anyhow!("eep crashed (a bug): see stderr")))
+        .unwrap_or_else(|e| json!({ "ok": false, "error": format!("{e:#}") }));
     println!("{out}");
+}
+
+/// App ids name files (roots, shims, launchers): one bad one could reach
+/// outside eep's folders, so every id from the command line is checked.
+fn check_ids<'a>(ids: impl IntoIterator<Item = &'a String>) -> Result<()> {
+    for id in ids {
+        if !eep_core::valid_id(id) {
+            anyhow::bail!("{id:?} is not an app id (a-z, 0-9 and -)");
+        }
+    }
+    Ok(())
 }
 
 /// The program name eep was started as, when it isn't `eep`.
@@ -185,6 +226,14 @@ fn shim(prog: &str) -> ! {
 }
 
 fn dispatch(cmd: Cmd) -> Result<Value> {
+    match &cmd {
+        Cmd::Install { ids, .. } | Cmd::Remove { ids } | Cmd::Update { ids, .. } => {
+            check_ids(ids)?;
+        }
+        Cmd::Run { id, .. } | Cmd::Info { id } | Cmd::Rollback { id } => check_ids([id])?,
+        Cmd::Doctor { app: Some(id) } => check_ids([id])?,
+        _ => {}
+    }
     let p = paths::Paths::from_env();
     if let Cmd::Run {
         id,
@@ -204,7 +253,7 @@ fn dispatch(cmd: Cmd) -> Result<Value> {
         } => state::update_index(&ctx.p),
         Cmd::Available => ops::available(&ctx),
         Cmd::Info { id } => ops::info(&ctx, &id),
-        Cmd::List => ops::list(&ctx),
+        Cmd::List { all } => ops::list(&ctx, all),
         Cmd::Install { ids, fetch } => ops::install(&ctx, &ids, fetch.get()),
         Cmd::Remove { ids } => ops::remove(&ctx, &ids),
         Cmd::Updates { count } => ops::updates(&ctx, count),

@@ -3,3 +3,6 @@
 # EEP_CHANNEL win over both.
 server = "https://prj786.github.io/eep"
 channel = "nixos-unstable"
+# Give every app on the computer a card in ~/Applications (pacman's,
+# AppImages, Steam games, your own launcher entries), not only eep's.
+find_apps = true

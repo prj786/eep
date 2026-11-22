@@ -11,13 +11,19 @@ let
   first = v: if builtins.isList v then (if v == [ ] then "" else str (builtins.head v)) else str v;
   one = n:
     let
-      found = lib.attrByPath (lib.splitString "." n) null p;
+      # A renamed or removed attribute is often an alias that THROWS when
+      # touched: caught here, so one stale catalog entry never fails the
+      # whole release (only that app is marked unavailable).
+      look = builtins.tryEval (lib.attrByPath (lib.splitString "." n) null p);
+      found = if look.success then look.value else null;
       d = found;
-      licenses = lib.toList (d.meta.license or [ ]);
-      free = lib.all (l: !(builtins.isAttrs l) || (l.free or true)) licenses;
+      licensed = builtins.tryEval (
+        lib.all (l: !(builtins.isAttrs l) || (l.free or true)) (lib.toList (d.meta.license or [ ]))
+      );
+      free = licensed.success && licensed.value;
       r = builtins.tryEval (builtins.seq d.outPath true);
     in
-    if found == null then { error = "no such attribute"; }
+    if found == null then { error = if look.success then "no such attribute" else "the attribute fails to evaluate (renamed or removed?)"; }
     else if !free then { error = "unfree"; }
     else if !(d.meta.available or true) then { error = "not available on this platform"; }
     else if !r.success then { error = "failed to evaluate"; }

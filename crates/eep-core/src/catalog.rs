@@ -52,6 +52,9 @@ pub fn parse(text: &str) -> Result<Catalog> {
         if !valid_id(id) {
             bail!("catalog: bad app id {id:?} (a-z, 0-9, '-')");
         }
+        if id.starts_with(crate::card::SYSTEM_PREFIX) {
+            bail!("catalog: app id {id:?}: `sys-` is for apps found on the computer");
+        }
         if e.attr.is_empty() || e.attr.contains(char::is_whitespace) {
             bail!("catalog: {id}: bad attr {:?}", e.attr);
         }

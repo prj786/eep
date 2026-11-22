@@ -122,6 +122,8 @@ pub fn run(up: &Upstream, o: &Opts) -> Result<Value> {
     };
     let dir = o.dist.join(&o.release);
     remove_stale_icons(&icons_dir, &idx)?;
+    // what every client checks on load: never publish an index it refuses
+    idx.validate()?;
     let mut json_bytes = serde_json::to_vec(&idx)?;
     json_bytes.push(b'\n');
     let zst = zstd::encode_all(json_bytes.as_slice(), 19)?;

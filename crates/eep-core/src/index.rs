@@ -3,7 +3,11 @@
 
 use std::collections::BTreeMap;
 
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
+
+use crate::card::{SYSTEM_PREFIX, inside};
+use crate::{StorePath, valid_id};
 
 pub use crate::catalog::Kind;
 
@@ -75,6 +79,41 @@ pub struct App {
     pub disk: u64,
 }
 
+impl App {
+    fn validate(&self) -> Result<()> {
+        if !self.out.is_empty() {
+            StorePath::from_absolute(&self.out).context("out")?;
+        }
+        for b in &self.closure {
+            StorePath::from_base_name(b).context("closure")?;
+        }
+        for r in [&self.exec, &self.desktop].into_iter().flatten() {
+            if !inside(r) {
+                bail!("path {r:?} climbs out of the app");
+            }
+        }
+        if let Some(i) = &self.icon_path
+            && !inside(i)
+            && StorePath::from_absolute(i).is_err()
+        {
+            bail!("icon path {i:?} is outside the store");
+        }
+        if let Some(i) = &self.icon
+            && !valid_rel(i)
+        {
+            bail!("strange icon {i:?}");
+        }
+        if self
+            .bin
+            .iter()
+            .any(|b| b.is_empty() || b.contains('/') || b.starts_with('.'))
+        {
+            bail!("bin entries must be plain program names");
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Piece {
     /// Compressed download size.
@@ -106,7 +145,69 @@ pub struct ChannelPointer {
     pub sha256: String,
 }
 
+/// A release or channel name, `nixos-26.11pre1125864.2786a2a72088`. It
+/// names folders (the icon cache) and URLs, so it is one plain name.
+pub fn valid_name(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 128
+        && !s.starts_with('.')
+        && s.bytes()
+            .all(|c| c.is_ascii_alphanumeric() || b"._-+".contains(&c))
+}
+
+/// A server-relative file (`icons/firefox.svg`, `index.json.zst`): plain
+/// names joined by `/`, never `..`, never absolute.
+pub fn valid_rel(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 512
+        && s.split('/').all(|c| {
+            !c.is_empty()
+                && !c.starts_with('.')
+                && c.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"._-+@".contains(&b))
+        })
+}
+
+impl ChannelPointer {
+    /// The pointer comes from the network: its names become paths and URLs.
+    pub fn validate(&self) -> Result<()> {
+        if !valid_name(&self.release) || !valid_name(&self.channel) || !valid_rel(&self.index) {
+            bail!(
+                "the channel pointer names something strange: release {:?}, index {:?}",
+                self.release,
+                self.index
+            );
+        }
+        Ok(())
+    }
+}
+
 impl Index {
+    /// An index comes from the network, and root's driver timer reads it
+    /// too: every field the client turns into a path, a file name or a
+    /// program argument must be what it claims to be.
+    pub fn validate(&self) -> Result<()> {
+        if !valid_name(&self.release) || !valid_name(&self.channel) {
+            bail!("the index names a strange release {:?}", self.release);
+        }
+        for (id, a) in &self.apps {
+            if !valid_id(id) || id.starts_with(SYSTEM_PREFIX) {
+                bail!("the index has a bad app id {id:?}");
+            }
+            a.validate().with_context(|| format!("index app {id}"))?;
+        }
+        for k in self.pieces.keys() {
+            StorePath::from_base_name(k).context("index piece")?;
+        }
+        for d in &self.system.driver {
+            StorePath::from_absolute(d).context("index driver")?;
+        }
+        for b in &self.system.driver_closure {
+            StorePath::from_base_name(b).context("index driver piece")?;
+        }
+        Ok(())
+    }
+
     pub fn app(&self, id: &str) -> Option<&App> {
         self.apps.get(id)
     }
@@ -124,5 +225,70 @@ impl Index {
             .fold((0, 0), |(bytes, n), p| {
                 (bytes + self.pieces.get(p).map_or(0, |x| x.dl), n + 1)
             })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn index() -> Index {
+        serde_json::from_value(serde_json::json!({
+            "eep_index": 0, "channel": "nixos-unstable",
+            "release": "nixos-26.11pre1125864.2786a2a72088", "rev": "x", "released": "y",
+            "apps": { "rg": {
+                "name": "ripgrep", "kind": "cli", "attr": "ripgrep",
+                "out": "/nix/store/whbrk657qmih065xal60m4khwf6cb9pj-ripgrep-15.2.0",
+                "exec": "bin/rg", "bin": ["rg"], "icon": "icons/rg.svg",
+                "closure": ["whbrk657qmih065xal60m4khwf6cb9pj-ripgrep-15.2.0"]
+            }},
+            "pieces": {}, "system": { "driver": [], "driver_closure": [] }
+        }))
+        .expect("index")
+    }
+
+    #[test]
+    fn a_good_index_passes() {
+        index().validate().expect("valid");
+    }
+
+    #[test]
+    fn hostile_indexes_are_refused() {
+        let mut i = index();
+        i.release = "/etc/cron.d".into();
+        assert!(i.validate().is_err(), "absolute release");
+        let mut i = index();
+        i.release = "../../..".into();
+        assert!(i.validate().is_err(), "climbing release");
+        let mut i = index();
+        let app = i.apps.remove("rg").expect("rg");
+        i.apps.insert("../../Trash".into(), app.clone());
+        assert!(i.validate().is_err(), "bad id");
+        let mut i = index();
+        i.apps.insert("sys-gimp".into(), app.clone());
+        assert!(i.validate().is_err(), "reserved id");
+        let mut i = index();
+        i.apps.get_mut("rg").expect("rg").bin = vec!["../../../../.ssh/authorized_keys".into()];
+        assert!(i.validate().is_err(), "bin path");
+        let mut i = index();
+        i.apps.get_mut("rg").expect("rg").icon = Some("icons/../../x".into());
+        assert!(i.validate().is_err(), "icon path");
+        let mut i = index();
+        i.apps.get_mut("rg").expect("rg").out = "/usr/bin".into();
+        assert!(i.validate().is_err(), "out outside the store");
+        let mut i = index();
+        i.system.driver = vec!["--option".into()];
+        assert!(i.validate().is_err(), "driver as a flag");
+    }
+
+    #[test]
+    fn names() {
+        assert!(valid_name("nixos-26.11pre1125864.2786a2a72088"));
+        assert!(!valid_name(".."));
+        assert!(!valid_name("a/b"));
+        assert!(valid_rel("icons/firefox.svg"));
+        assert!(!valid_rel("icons/../x"));
+        assert!(!valid_rel("/etc/passwd"));
+        assert!(!valid_rel("icons//x"));
     }
 }
