@@ -72,7 +72,7 @@ eep rollback firefox        # the previous version, instantly (kept 7 days)
 eep remove firefox          # card, launcher entry, roots; disk freed by gc
 eep gc [--dry-run]          # also runs by itself; keeps apps whose card is in the Trash
 eep repair                  # rebuild everything from the cards
-eep watch                   # follow ~/Apps (systemd user service, `eep setup`)
+eep watch                   # follow ~/Applications (a systemd user service; the package enables it)
 eep doctor                  # check the setup
 sudo eep driver install     # /run/opengl-driver for Nix apps (the one root step)
 ```
