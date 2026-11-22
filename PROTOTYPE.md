@@ -756,7 +756,8 @@ a plain text file to everything (launcher → xdg-open, Files → GIO default).
 
 - **Found apps** (`crates/eep/src/system.rs`): every visible launcher entry
   (`$XDG_DATA_HOME` + `$XDG_DATA_DIRS`, precedence, NoDisplay/Hidden/
-  OnlyShowIn/NotShowIn/TryExec like GIO) gets a `source = "system"` card,
+  TryExec; NOT OnlyShowIn — ewe's launcher shows those entries, so they
+  get cards too) gets a `source = "system"` card,
   id `sys-<desktop id>`, with `from` (pacman/appimage/steam/flatpak/local),
   pacman's package and version (one `pacman -Qo` for all), and its icon.
   Card leaves → the app is hidden (gotchas 33–34); card back → shown;

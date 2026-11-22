@@ -48,8 +48,6 @@ pub struct Dirs {
     pub icons: Vec<PathBuf>,
     /// `$XDG_DATA_DIRS/*/pixmaps`.
     pub pixmaps: Vec<PathBuf>,
-    /// What `OnlyShowIn` / `NotShowIn` are checked against.
-    pub desktops: Vec<String>,
     /// The icon theme (GTK's setting), searched after hicolor and pixmaps.
     pub theme: Option<String>,
 }
@@ -78,13 +76,6 @@ impl Dirs {
                 data.push(d);
             }
         }
-        let desktops = std::env::var("XDG_CURRENT_DESKTOP")
-            .ok()
-            .filter(|v| !v.is_empty())
-            .unwrap_or_else(|| "Hyprland".into())
-            .split(':')
-            .map(str::to_owned)
-            .collect();
         Self {
             user: p.launchers.clone(),
             system: data.iter().map(|d| d.join("applications")).collect(),
@@ -93,7 +84,6 @@ impl Dirs {
                 .chain(data.iter().map(|d| d.join("icons")))
                 .collect(),
             pixmaps: data.iter().map(|d| d.join("pixmaps")).collect(),
-            desktops,
             theme: gtk_icon_theme(&home),
         }
     }
@@ -162,7 +152,12 @@ enum Look {
     NotApp,
 }
 
-fn look(text: &str, dirs: &Dirs) -> Look {
+/// An app is what ewe's launcher shows: `Type=Application`, a name, not
+/// `NoDisplay`/`Hidden`, and a `TryExec` that exists (that app could not
+/// start anyway). `OnlyShowIn`/`NotShowIn` are NOT checked: the launcher
+/// (Quickshell) shows those entries, and every app it shows gets a card,
+/// so the user can remove it like any other.
+fn look(text: &str, _dirs: &Dirs) -> Look {
     let get = |k: &str| desktop::get(text, "Desktop Entry", k);
     if let Some(id) = get(HIDES) {
         return Look::Ours(id);
@@ -171,19 +166,10 @@ fn look(text: &str, dirs: &Dirs) -> Look {
         return Look::EepApp;
     }
     let yes = |k: &str| get(k).is_some_and(|v| v.eq_ignore_ascii_case("true"));
-    let names = |v: String| -> Vec<String> {
-        v.split(';')
-            .filter(|s| !s.is_empty())
-            .map(str::to_owned)
-            .collect()
-    };
-    let shown_here = |d: &String| dirs.desktops.contains(d);
     let app = get("Type").as_deref() == Some("Application")
         && !yes("NoDisplay")
         && !yes("Hidden")
         && get("Name").is_some_and(|n| !n.is_empty())
-        && get("OnlyShowIn").is_none_or(|v| names(v).iter().any(shown_here))
-        && get("NotShowIn").is_none_or(|v| !names(v).iter().any(shown_here))
         && get("TryExec").is_none_or(|t| on_path(&t));
     if app { Look::App } else { Look::NotApp }
 }
@@ -1004,7 +990,6 @@ mod tests {
             system: vec![r.join("usr/share/applications")],
             icons: vec![r.join("usr/share/icons")],
             pixmaps: vec![r.join("usr/share/pixmaps")],
-            desktops: vec!["Hyprland".into()],
             theme: None,
         };
         for d in [&p.apps, &dirs.user, &dirs.system[0]] {
@@ -1052,8 +1037,8 @@ mod tests {
         std::fs::write(&sys, entry("GIMP", "")).expect("write");
         let helper = entry("Helper", "NoDisplay=true\n");
         std::fs::write(t.dirs.system[0].join("helper.desktop"), helper).expect("write");
-        let kde = entry("K", "OnlyShowIn=KDE;\n");
-        std::fs::write(t.dirs.system[0].join("kde.desktop"), kde).expect("write");
+        let gone = entry("Broken", "TryExec=/nonexistent/AppRun\n");
+        std::fs::write(t.dirs.system[0].join("broken.desktop"), gone).expect("write");
         let icon = t.dirs.icons[0].join("hicolor/scalable/apps/app.svg");
         std::fs::create_dir_all(icon.parent().expect("dir")).expect("mkdir");
         std::fs::write(&icon, "<svg/>").expect("icon");
