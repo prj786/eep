@@ -1,0 +1,83 @@
+# eep — ewe executable package
+
+Apps the iOS way, on ewe: every app is one small **card** in
+`~/Applications`. The card is there, the app is in the launcher. Delete the
+card, the app is gone. Cards carry their app's icon, so Files shows them as
+apps; a card downloaded from the website or put there by Komble installs
+the same way. The contract for Files, Komble and the website:
+[docs/CARD.md](docs/CARD.md).
+
+Underneath, apps come prebuilt and signed from the Nix binary cache
+(cache.nixos.org). The client **never evaluates Nix**: an eep server
+precomputes an index that says exactly which store paths an app needs, and
+updates come as **binary patches** against what you already have. Nix stays
+the engine: it downloads, checks every signature and hash, and collects
+garbage.
+
+> Status: **prototype** (see [PROTOTYPE.md](PROTOTYPE.md)). It runs in the
+> ewe VM and the test container only. pacman stays the only package
+> manager on real machines until RFC-010 (house rule 10).
+
+## Layout
+
+| Path | What |
+|---|---|
+| `crates/eep-core` | Shared formats: store paths, nix-base32, narinfo, `.ls` listings, index, card, catalog, patch manifest, desktop entries, HTTP |
+| `crates/eep` | The client CLI |
+| `crates/eep-build` | The server side: indexes and patches (drives Nix eval in podman) |
+| `catalog/apps.toml` | The apps eep offers |
+| `test/` | Container tests (Arch + `extra/nix`): `test/run.sh e2e.sh`, `test/run.sh update.sh` |
+| `vm/setup-guest.sh` | Guest setup for the ewe VM |
+| `bench/` | Benchmark scripts and `RESULTS.md` |
+| `dist/` | Builder output (git-ignored), served as-is by any static web server |
+
+## Server side
+
+```sh
+cargo build --release
+eep-build releases                       # newest nixos-unstable releases
+eep-build index --release <R>            # dist/<R>/index.json.zst + icons (one Nix eval, in podman)
+eep-build patches --from <A> --to <R>    # dist/patches/<A>__<R>/ (zstd --patch-from, each one proven)
+eep-build cards --release <R>            # dist/<R>/cards/<Name>.eep (icon inside) + catalog.json
+eep-build publish --release <R>          # dist/channels/nixos-unstable.json → <R>
+python3 -m http.server -d dist 8000      # the VM sees it at http://10.0.2.2:8000
+```
+
+Caches live in `~/.cache/eep-build` (narinfos, listings and evals forever;
+NARs for patch building, safe to delete). Indexes are deterministic: the
+same release and catalog give byte-identical output.
+
+## Client
+
+```sh
+eep index update            # fetch the newest index (conditional GET)
+eep available               # what can be installed
+eep install firefox         # → ~/Applications/Firefox.eep, launcher entry, icon
+eep run firefox             # what the launcher entry calls: clean env, exec
+eep list                    # the cards
+eep updates [--count]       # what an update costs, with and without patches
+eep update [ids…]           # patches where possible, the rest upstream
+eep rollback firefox        # the previous version, instantly (kept 7 days)
+eep remove firefox          # card, launcher entry, roots; disk freed by gc
+eep gc [--dry-run]          # also runs by itself; keeps apps whose card is in the Trash
+eep repair                  # rebuild everything from the cards
+eep watch                   # follow ~/Apps (systemd user service, `eep setup`)
+eep doctor                  # check the setup
+sudo eep driver install     # /run/opengl-driver for Nix apps (the one root step)
+```
+
+Every command prints one JSON object and exits 0; errors are
+`{"ok":false,"error":"…"}` (house rule 5). `eep run` becomes the app.
+
+## Developing
+
+```sh
+cargo fmt --all && cargo clippy --all-targets -- -D warnings && cargo test
+test/run.sh e2e.sh          # install / run / remove / gc / Trash restore, in a container
+EEP_A=<A> EEP_B=<B> test/run.sh update.sh   # patched update, rollback, tamper test
+```
+
+Rules this code keeps: no `unsafe`; JSON on stdout only; every write that a
+watcher or another process can see is atomic (temp file + rename); one eep
+process changes state at a time (a lock file); nothing outside eep's own
+files is touched (house rule 9).

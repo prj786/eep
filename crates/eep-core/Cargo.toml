@@ -1,0 +1,20 @@
+[package]
+name = "eep-core"
+description = "eep's shared formats: store paths, narinfo, file listings, index, card"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+base64 = "0.22"
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+toml.workspace = true
+ureq = { version = "3", default-features = false, features = ["rustls"] }
+zstd.workspace = true
+
+[lints]
+workspace = true

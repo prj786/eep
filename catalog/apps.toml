@@ -1,0 +1,66 @@
+# The apps eep offers. One table per app; the key is eep's app id (stable,
+# never reused). Input to `eep-build index`.
+#
+#   attr    = nixpkgs attribute path (required)
+#   name    = display name (required)
+#   kind    = gui | cli | tool | system   (default gui)
+#   desktop = file name under share/applications (optional; otherwise the
+#             only .desktop file the package ships)
+#   bin     = programs put on PATH, for cli/tool apps (optional; default:
+#             the main program only)
+
+[firefox]
+attr = "firefox"
+name = "Firefox"
+kind = "gui"
+desktop = "firefox.desktop"
+
+[libreoffice]
+attr = "libreoffice"
+name = "LibreOffice"
+kind = "gui"
+desktop = "startcenter.desktop"
+
+[gimp]
+attr = "gimp"
+name = "GIMP"
+kind = "gui"
+
+[vlc]
+attr = "vlc"
+name = "VLC"
+kind = "gui"
+desktop = "vlc.desktop"
+
+[telegram]
+attr = "telegram-desktop"
+name = "Telegram"
+kind = "gui"
+
+[vscodium]
+attr = "vscodium"
+name = "VSCodium"
+kind = "gui"
+desktop = "codium.desktop"
+
+[calculator]
+attr = "gnome-calculator"
+name = "Calculator"
+kind = "gui"
+
+[ripgrep]
+attr = "ripgrep"
+name = "ripgrep"
+kind = "cli"
+
+[mesa-demos]
+attr = "mesa-demos"
+name = "Mesa demos"
+kind = "tool"
+bin = ["eglinfo", "glxinfo", "glxgears", "es2gears_wayland"]
+
+[vulkan-tools]
+attr = "vulkan-tools"
+name = "Vulkan tools"
+kind = "tool"
+bin = ["vulkaninfo", "vkcube"]

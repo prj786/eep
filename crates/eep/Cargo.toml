@@ -1,0 +1,21 @@
+[package]
+name = "eep"
+description = "eep — apps from the Nix binary cache, one card per app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+eep-core.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+toml.workspace = true
+zstd.workspace = true
+inotify = { version = "0.11", default-features = false }
+
+[lints]
+workspace = true

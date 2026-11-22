@@ -1,0 +1,13 @@
+# The client test bed: Arch + extra/nix with a daemon and a normal user in
+# nix-users, set up like the VM guest (vm/setup-guest.sh). No display: this
+# checks install / run / update / remove / gc, not how apps look.
+FROM docker.io/library/archlinux:base-devel
+RUN pacman -Syu --noconfirm --needed nix zstd jq python hyperfine desktop-file-utils && pacman -Scc --noconfirm
+# Arch's nix has no nix-users group: the daemon socket is open to every
+# user. eep brings its own group for the shared local cache directory.
+RUN groupadd -r eep && useradd -m -G eep tester
+RUN install -d -m 2775 -g eep /var/cache/eep/local /var/cache/eep/local/nar \
+ && printf 'StoreDir: /nix/store\nWantMassQuery: 0\nPriority: 10\n' > /var/cache/eep/local/nix-cache-info \
+ && printf '%s\n' 'experimental-features = nix-command' \
+      'extra-substituters = file:///var/cache/eep/local?priority=10' \
+      'narinfo-cache-negative-ttl = 0' 'sandbox = false' >> /etc/nix/nix.conf
