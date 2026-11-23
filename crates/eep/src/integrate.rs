@@ -209,12 +209,17 @@ fn rewrite(text: &str, card: &Card, eep: &Path, icon: Option<&str>) -> String {
     })
 }
 
+/// Delete the icon copies eep keeps for `id`.
+pub(crate) fn delete_icons(p: &Paths, id: &str) -> Result<usize> {
+    delete_where(&p.icons(), |n| is_icon_of(n, id))
+}
+
 /// `firefox.png` is firefox's icon; `firefox-beta.png` is not.
 fn is_icon_of(name: &str, id: &str) -> bool {
     name.strip_prefix(id).is_some_and(|r| r.starts_with('.'))
 }
 
-fn delete_launchers(p: &Paths, id: &str) -> Result<usize> {
+pub(crate) fn delete_launchers(p: &Paths, id: &str) -> Result<usize> {
     let mine = launcher_owners(p).remove(id).unwrap_or_default();
     for f in &mine {
         std::fs::remove_file(f).with_context(|| format!("removing {}", f.display()))?;
@@ -252,7 +257,7 @@ fn owner_of(entry: &Path) -> Option<String> {
 /// window's app id matches it (the bar's title, the dock's icon, default
 /// apps in mimeapps.list all go by that name). Only when the user or
 /// another app already has a file of that name does it get a prefix.
-fn launcher_path(p: &Paths, id: &str, name: &str) -> PathBuf {
+pub(crate) fn launcher_path(p: &Paths, id: &str, name: &str) -> PathBuf {
     let dst = p.launchers.join(name);
     if !dst.exists() || owner_of(&dst).as_deref() == Some(id) {
         return dst;
@@ -327,6 +332,10 @@ mod tests {
             from: None,
             entry: None,
             package: None,
+            url: None,
+            sha256: None,
+            size: None,
+            repo: None,
             channel: "c".into(),
             release: "r".into(),
             version: "3".into(),

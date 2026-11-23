@@ -32,6 +32,13 @@ pub fn run(
         }
         return crate::system::launch(p, &card, args);
     }
+    if card.is_appimage() {
+        // An AppImage decides itself what runs (its AppRun).
+        if exec.is_some() {
+            bail!("{} is an AppImage: --exec doesn't apply", card.name);
+        }
+        return crate::appimage::run(p, &card, extra_env, args);
+    }
     let out = PathBuf::from(&card.out);
     if !out.exists() {
         // A card copied in from elsewhere, or collected: fetch it now.

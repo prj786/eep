@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 
 use crate::activity::{self, Activity};
 use crate::paths::{Paths, write_atomic};
-use crate::{cards, env, integrate, journal, nix, patch, state, system};
+use crate::{appimage, cards, env, integrate, journal, nix, patch, state, system};
 
 /// How long the previous version stays for `eep rollback`.
 const KEEP_PREVIOUS: Duration = Duration::from_secs(7 * 24 * 3600);
@@ -90,7 +90,7 @@ fn installed_releases(p: &Paths) -> BTreeSet<String> {
     cards::all(p)
         .0
         .into_iter()
-        .filter(|f| !f.card.is_system())
+        .filter(|f| f.card.is_nix())
         .map(|f| f.card.release)
         .collect()
 }
@@ -113,6 +113,9 @@ fn one_or_many(mut results: Vec<Value>) -> Value {
 pub fn ready(p: &Paths, c: &Card) -> bool {
     if c.is_system() {
         return system::entry_file(p, c).is_some();
+    }
+    if c.is_appimage() {
+        return appimage::ready(p, c);
     }
     let out = Path::new(&c.out);
     std::fs::read_link(p.root(&c.id)).is_ok_and(|t| t == out) && out.exists()
@@ -327,6 +330,10 @@ fn finish_one(
         from: None,
         entry: None,
         package: None,
+        url: None,
+        sha256: None,
+        size: None,
+        repo: None,
         channel: idx.channel.clone(),
         release: idx.release.clone(),
         version: app.version.clone(),
@@ -408,6 +415,13 @@ pub fn list(ctx: &Ctx, all: bool) -> Result<Value> {
                     "present": system::entry_file(&ctx.p, c).is_some(),
                 });
             }
+            if c.is_appimage() {
+                return json!({
+                    "id": c.id, "name": c.name, "kind": c.kind, "source": c.source,
+                    "version": c.version, "url": c.url, "repo": c.repo, "size": c.size,
+                    "out": c.out, "present": ready(&ctx.p, c), "card": f.file,
+                });
+            }
             json!({
                 "id": c.id, "name": c.name, "kind": c.kind, "source": c.source,
                 "version": c.version, "release": c.release, "out": c.out,
@@ -430,9 +444,12 @@ pub fn available(ctx: &Ctx) -> Result<Value> {
         rel.as_ref()
             .map(|r| format!("{server}/{}/{r}", idx.release))
     };
+    // an AppImage that happens to share an id with an app of the index is
+    // another app: only eep's own cards say "installed" here
     let installed: std::collections::BTreeMap<String, Card> = cards::all(&ctx.p)
         .0
         .into_iter()
+        .filter(|f| f.card.is_nix())
         .map(|f| (f.card.id.clone(), f.card))
         .collect();
     let apps: Vec<Value> = idx
@@ -482,7 +499,9 @@ pub fn updates(ctx: &Ctx, count: bool) -> Result<Value> {
     let idx = state::load_index(&ctx.p)?;
     let pending = pending_updates(&ctx.p, &idx, &[]);
     if count {
-        return Ok(json!({ "ok": true, "count": pending.len() }));
+        // AppImages: what the last full check found (no network for a badge)
+        let images = appimage::pending(&ctx.p, &[]).len();
+        return Ok(json!({ "ok": true, "count": pending.len() + images }));
     }
     let apps: Vec<&App> = pending.iter().map(|(_, a)| *a).collect();
     let union: Vec<String> = apps
@@ -520,6 +539,14 @@ pub fn updates(ctx: &Ctx, count: bool) -> Result<Value> {
             "pieces": pieces, "patched": patched,
         }));
     }
+    // AppImages come whole: the newest release of each one's `repo`
+    for (f, l) in appimage::check_updates(&ctx.p) {
+        list.push(json!({
+            "id": f.card.id, "name": f.card.name, "source": f.card.source,
+            "from": f.card.version, "to": l.version, "rebuild_only": false,
+            "download": l.size, "download_full": l.size, "pieces": 1, "patched": 0,
+        }));
+    }
     let total = |k: &str| list.iter().map(|x| x[k].as_u64().unwrap_or(0)).sum::<u64>();
     let v = json!({
         "ok": true, "release": idx.release, "count": list.len(),
@@ -535,7 +562,7 @@ fn pending_updates<'a>(p: &Paths, idx: &'a Index, ids: &[String]) -> Vec<(Card, 
     cards::all(p)
         .0
         .into_iter()
-        .filter(|f| ids.is_empty() || ids.contains(&f.card.id))
+        .filter(|f| f.card.is_nix() && (ids.is_empty() || ids.contains(&f.card.id)))
         .filter_map(|f| {
             let app = idx.app(&f.card.id)?;
             (app.unavailable.is_none() && app.out != f.card.out).then_some((f.card, app))
@@ -547,15 +574,46 @@ pub fn update(ctx: &Ctx, ids: &[String], fetch: Fetch) -> Result<Value> {
     let _lock = state::lock(&ctx.p)?;
     let mut act = Activity::new(&ctx.p);
     let idx = state::load_index(&ctx.p)?;
+    let asked = ids;
     let ids: Vec<String> = pending_updates(&ctx.p, &idx, ids)
         .into_iter()
         .map(|(c, _)| c.id)
         .collect();
+    let images = appimage::pending(&ctx.p, asked);
     let mut v = install_many(ctx, &idx, &ids, fetch, &mut act, &|| false)?;
+    // AppImages after: each is one download; one that fails leaves the app
+    // as it was and does not stop the others
+    let mut failed = Vec::new();
+    let mut moved = Vec::new();
+    for (f, l) in images {
+        act.begin([activity::New {
+            id: &f.card.id,
+            name: &f.card.name,
+            card: Some(&f.file),
+            what: activity::What::Update,
+        }]);
+        match appimage::install(ctx, &f, Some(&l), &mut act, &|| false) {
+            Ok(card) => moved.push(json!({
+                "id": card.id, "version": card.version, "from": f.card.version,
+                "source": card.source, "out": card.out, "card": f.file,
+                "download_full": card.size,
+            })),
+            Err(e) => failed.push(json!({
+                "id": f.card.id, "name": f.card.name, "error": format!("{e:#}"),
+            })),
+        }
+        act.done(&f.card.id);
+    }
     if let Some(o) = v.as_object_mut()
-        && let Some(apps) = o.remove("apps")
+        && let Some(mut apps) = o.remove("apps")
     {
+        if let Some(a) = apps.as_array_mut() {
+            a.extend(moved);
+        }
         o.insert("updated".into(), apps);
+        if !failed.is_empty() {
+            o.insert("failed".into(), json!(failed));
+        }
     }
     Ok(v)
 }
@@ -567,6 +625,12 @@ pub fn rollback(ctx: &Ctx, id: &str) -> Result<Value> {
     if f.card.is_system() {
         bail!(
             "{} is not an eep app: its own package manager updates it",
+            f.card.name
+        );
+    }
+    if f.card.is_appimage() {
+        bail!(
+            "{} is an AppImage: no previous version is kept",
             f.card.name
         );
     }
@@ -622,6 +686,9 @@ pub fn reconcile_with(ctx: &Ctx, full: bool, act: &mut Activity) -> Result<Value
     };
     let recovered = journal::recover(p)?;
     clean_stale_roots(p);
+    // AppImage files dropped into ~/Applications become cards (and are then
+    // listed like every other card below).
+    let (adopted, not_adopted) = appimage::adopt_dropped(ctx, act);
     let launchers = integrate::launcher_owners(p);
     let cards::Listing {
         good,
@@ -632,17 +699,25 @@ pub fn reconcile_with(ctx: &Ctx, full: bool, act: &mut Activity) -> Result<Value
     // a card that doesn't parse still keeps its app
     let mut ids: BTreeSet<String> = kept;
     let mut work: Vec<&cards::Found> = Vec::new();
+    let mut images: Vec<&cards::Found> = Vec::new();
     for f in &good {
         let c = &f.card;
         if !ids.insert(c.id.clone()) || c.is_system() {
             continue; // a second card for the same app: the first one counts
         }
         if full || !ready(p, c) || !integrated(p, c, &launchers) {
-            work.push(f);
+            if c.is_appimage() {
+                images.push(f);
+            } else {
+                work.push(f);
+            }
         }
     }
-    let mut touched = Vec::new();
-    let mut failed = Vec::new();
+    let mut touched: Vec<Value> = adopted
+        .iter()
+        .map(|a| json!({ "id": a["id"], "adopted": true }))
+        .collect();
+    let mut failed = not_adopted;
     // Which of them are in the store already (a card back from the Trash,
     // a repair) and which have to be fetched: one Nix call for all. When
     // Nix doesn't answer nothing is known, so nothing is touched: guessing
@@ -662,7 +737,13 @@ pub fn reconcile_with(ctx: &Ctx, full: bool, act: &mut Activity) -> Result<Value
     let (fetch, here): (Vec<&cards::Found>, Vec<&cards::Found>) =
         work.into_iter().partition(|f| absent.contains(&f.card.out));
     // what was said about an app that is fine now, or gone, no longer holds
-    act.keep_only(&fetch.iter().map(|f| f.card.id.as_str()).collect());
+    act.keep_only(
+        &fetch
+            .iter()
+            .chain(&images)
+            .map(|f| f.card.id.as_str())
+            .collect(),
+    );
 
     for f in here {
         match settle(ctx, f) {
@@ -674,6 +755,26 @@ pub fn reconcile_with(ctx: &Ctx, full: bool, act: &mut Activity) -> Result<Value
     }
     if !fetch.is_empty() {
         fetch_cards(ctx, &fetch, act, &mut touched, &mut failed);
+    }
+    // AppImage cards: one download each (or none: a card back from the
+    // Trash is still unpacked). Taking the card out stops its download.
+    for f in images {
+        let here = appimage::dir(p, &f.card).is_some_and(|d| d.exists());
+        if !here {
+            act.begin([activity::New {
+                id: &f.card.id,
+                name: &f.card.name,
+                card: Some(&f.file),
+                what: activity::What::Install,
+            }]);
+        }
+        match appimage::install(ctx, f, None, act, &|| !f.file.exists()) {
+            Ok(_) => {
+                act.done(&f.card.id);
+                touched.push(json!({ "id": f.card.id, "fetched": !here }));
+            }
+            Err(e) => give_up(act, &mut failed, f, &e),
+        }
     }
     // Only a sure listing may forget: a moved or unreadable ~/Applications,
     // or a card whose id can't be read, must never uninstall anything.
@@ -835,6 +936,19 @@ fn current_index(p: &Paths) -> Option<Index> {
 /// again".
 pub fn add(ctx: &Ctx, file: &Path) -> Result<Value> {
     let p = &ctx.p;
+    // An AppImage file: it becomes a card (and the file goes, as a card
+    // that is installed moves into Applications).
+    if file
+        .file_name()
+        .is_some_and(|n| appimage::is_appimage_name(&n.to_string_lossy()))
+    {
+        let _lock = state::lock(p)?;
+        let f = appimage::adopt(ctx, file, &mut Activity::new(p))?;
+        return Ok(json!({
+            "ok": true, "id": f.card.id, "name": f.card.name, "version": f.card.version,
+            "card": f.file, "moved": true,
+        }));
+    }
     let text =
         std::fs::read_to_string(file).with_context(|| format!("reading {}", file.display()))?;
     let card = Card::parse(&text)?;
@@ -903,6 +1017,15 @@ pub fn card_info(ctx: &Ctx, file: &Path) -> Result<Value> {
         v["present"] = json!(system::entry_file(p, &card).is_some());
         return Ok(v);
     }
+    if card.is_appimage() {
+        // one file, from where the card says
+        v["url"] = json!(card.url);
+        if !ready {
+            v["download"] = json!(card.size.unwrap_or(0));
+            v["pieces"] = json!(1);
+        }
+        return Ok(v);
+    }
     if let Ok(idx) = state::load_index(p)
         && let Some(app) = idx.app(&card.id)
     {
@@ -948,6 +1071,10 @@ fn integrated(
     c: &Card,
     launchers: &std::collections::BTreeMap<String, Vec<PathBuf>>,
 ) -> bool {
+    if c.is_appimage() {
+        // every AppImage gets a launcher entry (one of eep's when it has none)
+        return launchers.contains_key(&c.id);
+    }
     (c.desktop.is_none() || launchers.contains_key(&c.id))
         && c.bin
             .iter()
@@ -993,19 +1120,23 @@ pub fn gc(ctx: &Ctx, dry_run: bool) -> Result<Value> {
     // so a restore never downloads (macOS keeps an .app in the Trash whole).
     let keep = ctx.p.roots.join(format!(".trash-{}", std::process::id()));
     let mut kept = 0;
-    for c in trash_cards() {
+    let trash = trash_cards();
+    for c in trash.iter().filter(|c| c.is_nix()) {
         if Path::new(&c.out).exists()
             && nix::realise(&c.out, &keep.join(format!("k{kept}"))).is_ok()
         {
             kept += 1;
         }
     }
+    // unpacked AppImages nothing keeps (their own folder, not the store)
+    let (image_bytes, image_dirs) = appimage::gc(&ctx.p, &trash, dry_run);
     let g = nix::gc(dry_run);
     let _ = std::fs::remove_dir_all(&keep);
     let g = g?;
     Ok(json!({
         "ok": true, "dry_run": dry_run, "freed": g.freed_bytes, "paths": g.paths,
         "expired_previous": expired, "kept_for_trash": kept,
+        "appimage": { "freed": image_bytes, "removed": image_dirs },
         "seconds": t0.elapsed().as_secs_f64(),
     }))
 }

@@ -7,6 +7,7 @@
 //! Progress, including Nix's own, goes to stderr.
 
 mod activity;
+mod appimage;
 mod cards;
 mod driver;
 mod env;

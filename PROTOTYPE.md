@@ -1,7 +1,7 @@
 # eep — prototype guide
 
 > **eep = ewe executable package.** Prototype plan, written 2026-11-22.
-> Status: **0.3.0-beta** (2026-11-23): installing shows (0.2: every app a card). Steps 0–6 done, in containers and the ewe VM;
+> Status: **0.4.0-beta** (2026-11-23): AppImages are cards (0.3: installing shows; 0.2: every app a card). Steps 0–6 done, in containers and the ewe VM;
 > every go/no-go row passes (`bench/RESULTS.md`). Waiting on the owner:
 > go/no-go (then RFC-010), B11 (real GPU), the GitHub repo. See **§13**.
 > Read this once from top to bottom. Then work through the steps in order;
@@ -832,3 +832,46 @@ should be opening dialog with icon and name top of the install button."
   download that never goes backwards, an older release's card becoming
   today's version, a bad card beside a good one, a card leaving mid-fetch,
   `--ask`).
+
+### 2026-11-23: AppImages are cards, 0.4.0-beta
+
+Owner: "give an answer if we can manage appimages same way as we are doing
+it for eep", then "start doing appimages same as eep apps", then "release".
+
+- **A third kind of card**, `source = "appimage"` (docs/CARD.md,
+  "AppImages"): `url` (https only), `sha256` (checked when the card names
+  it, written once installed), `size`, `repo` (a GitHub repository whose
+  newest release is the update). `out` is RELATIVE to eep's data folder,
+  `appimage/<id>/<first 16 hex of the sha256>`: a card carries no home
+  path. The ready rule a file manager reads became "the root link's target
+  ends with `out`" (for a Nix app it still equals it).
+- **Unpacked once, run from the tree** (`appimage.rs`): `--appimage-extract`
+  into `~/.local/share/eep/appimage/<id>/<key>`, `eep run` becomes its
+  `AppRun` with `APPDIR` set and no `APPIMAGE` (an app that finds no file of
+  itself does not try to replace it; eep updates it). The downloaded file
+  is not kept. One that will not unpack is kept whole and run as it is —
+  only when it is an ELF file: half a copy is never "installed".
+- **A file is enough**: an `.AppImage` dropped into `~/Applications` (the
+  watcher), or `eep add <file>`, becomes a card and the file goes. The id
+  comes from the entry inside (`org.gimp.GIMP.desktop` → `gimp`); an id an
+  app of another kind already has gets `-appimage`. A file still being
+  copied waits for the pass its last write wakes (`settled`).
+- **Updates**: `eep updates` asks each `repo`'s newest release and keeps the
+  flavour of file that is installed (`…-x86_64.AppImage`, not
+  `…-addons-x86_64.AppImage`); GitHub's `digest` pins the hash. The answers
+  are cached for `--count`. `eep update` downloads and unpacks first and
+  switches after: a failed download leaves the app as it was. No rollback.
+- **The same life otherwise**: the activity file while it downloads, the
+  Trash removes it at once and keeps it whole, `eep gc` frees unpacked apps
+  nothing keeps (`"appimage": {freed, removed}` in its answer).
+- An AppImage card is never taken for a Nix app that shares its id
+  (updates, patch releases, `available`).
+- Tried for real in a sandboxed home: appimagetool from a card (8 s) and
+  from a dropped file, Lite XL 2.1.8-rc3 → 2.1.8 through `eep updates` /
+  `eep update`. Unit tests: the card format, adopt, a newer file, the Trash
+  and gc, a file that will not unpack, a download checked, stopped and
+  refused when it is not the file the card pins. ewe Files 0.4.2 reads the
+  new ready rule (ewe-apps).
+- Not yet: Komble still installs AppImages its own way (they stay "found"
+  apps); AppImage apps in eep's own index; a container e2e case. Never run
+  `eep gc` in a test home on a machine with Nix: it collects the real store.
