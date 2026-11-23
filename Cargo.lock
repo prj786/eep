@@ -219,7 +219,7 @@ dependencies = [
 
 [[package]]
 name = "eep"
-version = "0.2.0-beta"
+version = "0.3.0-beta"
 dependencies = [
  "anyhow",
  "clap",
@@ -234,7 +234,7 @@ dependencies = [
 
 [[package]]
 name = "eep-build"
-version = "0.2.0-beta"
+version = "0.3.0-beta"
 dependencies = [
  "anyhow",
  "clap",
@@ -249,7 +249,7 @@ dependencies = [
 
 [[package]]
 name = "eep-core"
-version = "0.2.0-beta"
+version = "0.3.0-beta"
 dependencies = [
  "anyhow",
  "base64 0.22.1",

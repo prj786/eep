@@ -132,7 +132,20 @@ pub fn save(p: &Paths, card: &Card, file: Option<&Path>) -> Result<PathBuf> {
     Ok(path)
 }
 
-fn free_name(p: &Paths, card: &Card) -> Result<PathBuf> {
+/// Whether `file` sits in `~/Applications` itself (through links too).
+pub fn in_apps(p: &Paths, file: &Path) -> bool {
+    let Some(dir) = file.parent() else {
+        return false;
+    };
+    match (dir.canonicalize(), p.apps.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => dir == p.apps,
+    }
+}
+
+/// A file name in `~/Applications` for `card` that no other card has:
+/// `<Name>.eep`, else `<Name> 2.eep`…
+pub fn free_name(p: &Paths, card: &Card) -> Result<PathBuf> {
     let first = p.apps.join(card.file_name());
     if !first.exists() {
         return Ok(first);

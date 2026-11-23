@@ -1,7 +1,7 @@
 # eep — prototype guide
 
 > **eep = ewe executable package.** Prototype plan, written 2026-11-22.
-> Status: **0.2.0-beta** (2026-11-22): every app a card. Steps 0–6 done, in containers and the ewe VM;
+> Status: **0.3.0-beta** (2026-11-23): installing shows (0.2: every app a card). Steps 0–6 done, in containers and the ewe VM;
 > every go/no-go row passes (`bench/RESULTS.md`). Waiting on the owner:
 > go/no-go (then RFC-010), B11 (real GPU), the GitHub repo. See **§13**.
 > Read this once from top to bottom. Then work through the steps in order;
@@ -540,6 +540,12 @@ Record it honestly.
 37. **A broken card or a moved `~/Applications` must change nothing.** Forgetting (eep apps) and hiding (found apps) run only after a *sure* listing: the folder was read and every card's id is known (a card that doesn't parse keeps its id through a lenient TOML read). The watcher never recreates a moved `~/Applications` (it waits on the parent for it to come back); it makes the folder only on the very first run.
 38. **Index fields are network input, and root reads them** (the driver timer). `Index::validate` runs on every fetch and load (and in `eep-build` before publishing): plain names for release/channel/ids, store paths for out/closure/driver, `inside()` for exec/desktop/icon, plain program names for `bin`. Fable's review found `release = "/etc/cron.d"` and `eep remove '../..'` reaching outside eep's folders before this.
 
+39. **Nix says how far a fetch is, as JSON lines.** `nix-store --realise … --log-format internal-json` prints `@nix {…}` on stderr, through the daemon too: `result` type 106 on the realise activity gives the expected totals (`[101, download bytes]`, `[100, unpacked bytes]`), every piece is a type 100 activity with `result` 105 `[done, size]`. The totals grow while Nix still asks the caches, so what eep shows never goes backwards. Errors are `msg` level 0, with terminal colours.
+40. **Starting an installed app must not wait for eep's lock.** `eep open` used to reconcile first; while the watcher downloaded one app, a click on ANY card in Files hung until that download ended (and three clicks started the app three times). An app that is ready starts with no lock; only a card that still needs fetching takes it.
+41. **One app that can't be fetched must not stop the pass.** The watcher's pass returned at the first failed `realise`: every card after it (by file name) stayed uninstalled and nothing was forgotten. Each card now fails alone, is listed under `failed`, and is tried again (20 s, then less often).
+42. **A pass that fetched nothing must not sync the store.** The crash journal's guard ran `sync -f /nix/store` at the end of every pass — on every `.desktop` change — flushing the whole filesystem under eep's lock. Only a pass that fetches opens the journal now.
+43. **A window that cannot be resized floats on Hyprland at the size of the whole screen** (GTK takes the first size the compositor offers). ewe Files' Install window is an ordinary window; ewe's `eep-install` window rule gives it its size and place.
+
 ## 11. Reference
 
 ```sh
@@ -794,3 +800,35 @@ a plain text file to everything (launcher → xdg-open, Files → GIO default).
   of 152 MB, verify, rollback, tamper) pass on the new code.
 - ewe 0.49 depends on eep; its launcher leaves cards in ~/Applications out
   of file results; ewe Files 0.3.1 says "update ewe" for a card without eep.
+
+### 2026-11-23: installing shows, 0.3.0-beta
+
+Owner, after a day on the real machine: "Applications directory becomes
+laggy not functional and makes UI to broke … when I download eep file and
+move it feels like installed but 1st start takes like forever … it should
+be taking long time so I know it's installing … when I click on eep it
+should be opening dialog with icon and name top of the install button."
+
+- **The frozen Applications folder was ewe Files** (0.3.1), not eep: its
+  windowed grid measured the row height from the first rendered row; with
+  one- and two-line app names the rows differed and the page never came
+  back from a microtask loop (reproduced headless: 105 % CPU forever after
+  eight Down keys; the WebKit core dumps on the owner's machine are the
+  10 s watchdog of a closed window whose page was stuck). Fixed in ewe
+  Files 0.4 (every tile one height; the measurement no longer depends on
+  what is rendered).
+- **"First start takes forever"** was two things: nothing said the app was
+  still downloading (the card looked installed the moment it landed), and
+  `eep open` waited for the watcher's lock (gotcha 40).
+- eep 0.3: the activity file and the readiness rule (`docs/CARD.md`,
+  "While an app installs"), progress from Nix's JSON log (gotcha 39),
+  `eep add` (Install = the card moves into `~/Applications`), `eep card`
+  (what a card is, before installing), `eep open --ask` (the card handler:
+  an app that is not installed goes to the Install window), a card that
+  arrives is installed as the index has the app today, retries, cancel by
+  taking the card out, per-app failures (gotchas 41–42).
+- Container: `test/run.sh e2e.sh` 16/16 and the new `test/run.sh
+  install-flow.sh` (what a card is, add, real progress on a 264 MB
+  download that never goes backwards, an older release's card becoming
+  today's version, a bad card beside a good one, a card leaving mid-fetch,
+  `--ask`).

@@ -6,6 +6,7 @@
 //! which becomes the app (it prints JSON only if it can't start it).
 //! Progress, including Nix's own, goes to stderr.
 
+mod activity;
 mod cards;
 mod driver;
 mod env;
@@ -99,8 +100,19 @@ enum Cmd {
     Repair,
     /// Follow ~/Applications: a card copied in gets installed, a deleted one removed.
     Watch,
-    /// Open a card (double-click): install it if needed, then start the app.
-    Open { file: std::path::PathBuf },
+    /// Open a card (double-click): start its app, installing it first if needed.
+    Open {
+        file: std::path::PathBuf,
+        /// Not installed yet: let the installer (ewe Files) show the app
+        /// and its Install button instead of installing right away.
+        #[arg(long)]
+        ask: bool,
+    },
+    /// Put a card into ~/Applications and install its app (what a file
+    /// manager's "Install" does). The app is not started.
+    Add { file: std::path::PathBuf },
+    /// What a card file is, and what installing it would take.
+    Card { file: std::path::PathBuf },
     /// One-time per-user setup: card file type, watcher and update timer.
     Setup,
     /// Free the disk space of removed apps (and old previous versions).
@@ -261,7 +273,9 @@ fn dispatch(cmd: Cmd) -> Result<Value> {
         Cmd::Rollback { id } => ops::rollback(&ctx, &id),
         Cmd::Repair => ops::reconcile(&ctx, true),
         Cmd::Watch => watch::watch(&ctx),
-        Cmd::Open { file } => watch::open(&ctx, &file),
+        Cmd::Open { file, ask } => watch::open(&ctx, &file, ask),
+        Cmd::Add { file } => ops::add(&ctx, &file),
+        Cmd::Card { file } => ops::card_info(&ctx, &file),
         Cmd::Setup => watch::setup(&ctx),
         Cmd::Gc { dry_run } => ops::gc(&ctx, dry_run),
         Cmd::Doctor { app } => ops::doctor(&ctx, app.as_deref()),

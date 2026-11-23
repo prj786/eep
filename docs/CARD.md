@@ -5,12 +5,61 @@ A card is one small TOML file, `<Name>.eep`, MIME type `application/x-eep`.
 
 | The user… | What happens |
 |---|---|
-| drops a card into `~/Applications` (from Downloads, the website, Komble) | `eep watch` installs it (fetches what it names, adds the launcher entry) |
-| double-clicks a card anywhere | `eep open <file>`: copies it into `~/Applications` if needed, installs, starts the app |
+| drops a card into `~/Applications` (from Downloads, the website, Komble) | `eep watch` installs it and says how far it is (see "While an app installs") |
+| double-clicks a card in `~/Applications` | the app starts (`eep open <file>`) |
+| double-clicks a card anywhere else | the installer shows the app's icon and name over an **Install** button (`eep open --ask <file>` hands the card to ewe Files); Install moves the card into `~/Applications` (`eep add <file>`) |
 | moves a card to Trash / deletes it | the app leaves the launcher at once |
 | restores it from the Trash | it comes back with no download (an app in the Trash is kept whole) |
 | empties the Trash (or deleted it outright) | its disk is freed by itself (`eep gc`, run every few hours) |
 | renames it | nothing: the `id` inside counts |
+
+**Which version gets installed.** A card whose app is not on this computer
+yet is installed as eep's index has the app *today*: the current version,
+with update patches, and never the store paths a downloaded file names. The
+card is rewritten to say what was installed. Only an app the index does not
+have (another channel, a retired app) is fetched exactly as its card names
+it. A card whose store path is here already (back from the Trash) is used
+as it is, with no download.
+
+## While an app installs (eep 0.3)
+
+A card in `~/Applications` is an app, but one that just arrived is not
+there yet. Two things say so, and a file manager needs only these:
+
+**Is it ready?** eep keeps a link to the store path of every app it has
+fetched: `$XDG_STATE_HOME/eep/roots/<id>` (default `~/.local/state/eep/roots/`).
+An eep app can start when that link points at the card's `out`. (A found
+app, `source = "system"`, is always ready.) One `readlink`; the card does
+not change when the app becomes ready, so ask whenever you list the folder.
+
+**How far is it?** `$XDG_RUNTIME_DIR/eep/activity.json` (`~/.cache/eep/`
+in a session without a runtime directory) lists what eep is fetching right
+now. It is written a few times a second while something downloads, by
+rename (never half a file), and removed when nothing is in flight:
+
+```json
+{ "eep_activity": 0, "updated": 1763895000, "apps": [
+  { "id": "blender", "name": "Blender",
+    "card": "/home/you/Applications/Blender.eep",
+    "what": "install", "state": "downloading",
+    "done": 1048576, "total": 8388608, "download": 2097152, "pid": 1234 } ] }
+```
+
+| Field | |
+|---|---|
+| `what` | `install` or `update` (an app that is updating still starts) |
+| `state` | `waiting` (eep is busy with another app) → `downloading` → `finishing` (launcher entry, card); or `failed` with `error` in plain words |
+| `done`, `total` | bytes unpacked so far and in all; 0 = not known yet. Apps fetched together share one count. Never goes backwards |
+| `download` | bytes the whole fetch takes off the network (for "120 of 264 MB": `download × done ÷ total`) |
+| `card` | the app's card (absent for an install from a store, until it is done) |
+| `pid` | the eep that says so. **Ignore an entry whose pid is gone** (eep was killed); eep's next write drops it |
+
+A card with no entry that is not ready is waiting for `eep watch` to start
+(half a second), or for another eep to finish. `failed` entries stay while
+`eep watch` runs: it tries again by itself (after 20 s, then less and less
+often, and at once when anything in `~/Applications` changes); `eep add
+<card>` is "try again now". Taking the card out of `~/Applications` while
+its app downloads stops the download.
 
 ## Apps that were on the computer already (eep 0.2)
 
@@ -68,7 +117,9 @@ a card yourself — let eep do it (`eep install <id>` writes one).
 | install / uninstall | `eep install <id>` · `eep remove <id>` (a `sys-` id: show / hide) |
 | updates (badge: `--count`) | `eep updates` · `eep updates --count` · `eep update [ids…]` |
 | installed apps | `eep list` (eep's) · `eep list --all` (every card) |
-| open a card | `eep open <file>` (becomes the app) |
+| open a card | `eep open <file>` (becomes the app; installs it first if needed). `--ask`: when it is not installed, the installer (ewe Files, or `$EEP_INSTALLER`) shows it instead |
+| what a card file is, before installing | `eep card <file>` → `installed` (the card holding this app in Applications), `ready`, `inside`, `download` + `pieces` (what an install would fetch now) |
+| install from a card file | `eep add <file>`: moves it into `~/Applications`, installs, answers when done (`{"ok":true,"id","card"}`); the app is not started |
 | is eep set up here | `eep doctor` |
 
 ## Files

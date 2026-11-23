@@ -3,4 +3,4 @@ Type=Application
 Name=eep
 NoDisplay=true
 MimeType=application/x-eep;
-Exec=/usr/bin/eep open %f
+Exec=/usr/bin/eep open --ask %f

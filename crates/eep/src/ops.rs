@@ -9,11 +9,17 @@ use eep_core::card::{self, Card};
 use eep_core::index::{App, Index};
 use serde_json::{Value, json};
 
+use crate::activity::{self, Activity};
 use crate::paths::{Paths, write_atomic};
 use crate::{cards, env, integrate, journal, nix, patch, state, system};
 
 /// How long the previous version stays for `eep rollback`.
 const KEEP_PREVIOUS: Duration = Duration::from_secs(7 * 24 * 3600);
+
+/// How old the index may be for an install that starts now without asking
+/// the server first (a card downloaded a minute ago may be of a newer
+/// release than the index held).
+const INDEX_FRESH: Duration = Duration::from_secs(10 * 60);
 
 #[derive(Debug)]
 pub struct Ctx {
@@ -100,8 +106,21 @@ fn one_or_many(mut results: Vec<Value>) -> Value {
     json!({ "ok": true, "apps": results })
 }
 
+/// Whether the app of a card can start right now: an eep app is fetched
+/// and kept (its root links to the card's store path), a found app's
+/// launcher entry is on this computer. This is the contract a file manager
+/// reads too (docs/CARD.md, "While an app installs").
+pub fn ready(p: &Paths, c: &Card) -> bool {
+    if c.is_system() {
+        return system::entry_file(p, c).is_some();
+    }
+    let out = Path::new(&c.out);
+    std::fs::read_link(p.root(&c.id)).is_ok_and(|t| t == out) && out.exists()
+}
+
 pub fn install(ctx: &Ctx, ids: &[String], fetch: Fetch) -> Result<Value> {
     let _lock = state::lock(&ctx.p)?;
+    let mut act = Activity::new(&ctx.p);
     // Found apps (`sys-…`) only come back: nothing to fetch.
     let (found, ids): (Vec<String>, Vec<String>) = ids
         .iter()
@@ -118,7 +137,7 @@ pub fn install(ctx: &Ctx, ids: &[String], fetch: Fetch) -> Result<Value> {
         }
     }
     let idx = state::index_or_fetch(&ctx.p)?;
-    let mut v = install_many(ctx, &idx, &ids, fetch)?;
+    let mut v = install_many(ctx, &idx, &ids, fetch, &mut act, &|| false)?;
     // One app: its fields at the top level, next to the totals.
     if let Some(apps) = v["apps"].as_array().filter(|a| a.len() == 1).cloned()
         && let (Some(o), Some(app)) = (v.as_object_mut(), apps[0].as_object())
@@ -137,7 +156,18 @@ pub fn install(ctx: &Ctx, ids: &[String], fetch: Fetch) -> Result<Value> {
 /// keeps all its download slots busy across apps, instead of waiting for
 /// one app's slowest piece before starting the next app. Patches for all
 /// of them are applied first, in one batch.
-fn install_many(ctx: &Ctx, idx: &Index, ids: &[String], fetch: Fetch) -> Result<Value> {
+///
+/// `act` says how far the fetch is to whoever shows it; `stop` is asked
+/// several times a second and ends the fetch by answering `true` (the
+/// cards being installed left `~/Applications`).
+fn install_many(
+    ctx: &Ctx,
+    idx: &Index,
+    ids: &[String],
+    fetch: Fetch,
+    act: &mut Activity,
+    stop: &dyn Fn() -> bool,
+) -> Result<Value> {
     let p = &ctx.p;
     let t0 = Instant::now();
     let recovered = journal::recover(p)?;
@@ -153,6 +183,16 @@ fn install_many(ctx: &Ctx, idx: &Index, ids: &[String], fetch: Fetch) -> Result<
             todo.push((id.as_str(), app, cards::find(p, id)));
         }
     }
+    let names: Vec<&str> = todo.iter().map(|(id, ..)| *id).collect();
+    act.begin(todo.iter().map(|(id, app, existing)| activity::New {
+        id,
+        name: &app.name,
+        card: existing.as_ref().map(|f| f.file.as_path()),
+        what: match existing {
+            Some(f) if Path::new(&f.card.out).exists() => activity::What::Update,
+            _ => activity::What::Install,
+        },
+    }));
 
     // Plan: one validity query for all closures together.
     let union: Vec<String> = todo
@@ -170,6 +210,9 @@ fn install_many(ctx: &Ctx, idx: &Index, ids: &[String], fetch: Fetch) -> Result<
     // Patches for what's missing, then the realise: Nix takes patched
     // pieces from the local cache and the rest from upstream.
     let mut applied = patch::Applied::default();
+    if !missing.is_empty() {
+        act.state(&names, activity::State::Downloading);
+    }
     if fetch.patches && !missing.is_empty() {
         let from = installed_releases(p);
         match patch::candidates(&state::config(p)?, &from, &idx.release, &missing)
@@ -183,21 +226,28 @@ fn install_many(ctx: &Ctx, idx: &Index, ids: &[String], fetch: Fetch) -> Result<
     let batch = p.roots.join(format!(".batch-{}", std::process::id()));
     let fetching = journal::begin(p, "install")?;
     let mut fell_back = false;
-    let mut realised = if outs.is_empty() {
-        Ok(())
-    } else {
-        nix::realise_many(&outs, &batch.join("r"))
+    let realise = |act: &mut Activity| {
+        if outs.is_empty() {
+            return Ok(());
+        }
+        nix::realise_watched(&outs, &batch.join("r"), &mut |progress| {
+            act.progress(&names, progress);
+            !stop()
+        })
     };
+    let mut realised = realise(act);
     patch::clean(&applied);
     if let Err(e) = &realised
         && applied.patched > 0
+        && !stop()
     {
         // Nix refused something we offered: fetch everything upstream.
         eprintln!("eep: {e:#}; retrying without patches");
         fell_back = true;
-        realised = nix::realise_many(&outs, &batch.join("r"));
+        realised = realise(act);
     }
     let per_app = realised.and_then(|()| {
+        act.state(&names, activity::State::Finishing);
         todo.into_iter()
             .zip(shares)
             .map(|((id, app, existing), share)| finish_one(ctx, idx, id, app, existing, share))
@@ -207,6 +257,9 @@ fn install_many(ctx: &Ctx, idx: &Index, ids: &[String], fetch: Fetch) -> Result<
     let _ = std::fs::remove_dir_all(&batch);
     drop(fetching); // syncs the store, drops the journal
     let per_app = per_app?;
+    for id in &names {
+        act.done(id);
+    }
 
     let download = if fell_back {
         download_full
@@ -238,6 +291,14 @@ fn finish_one(
     (download_full, pieces_new): (u64, usize),
 ) -> Result<Value> {
     let p = &ctx.p;
+    // The card was there when this was planned and is gone now: its owner
+    // took the app out while it downloaded. Writing the card back would
+    // install what they just removed.
+    if let Some(f) = &existing
+        && !f.file.exists()
+    {
+        return Ok(json!({ "id": id, "left": true }));
+    }
     nix::realise(&app.out, &p.root(id))?;
     let (mut previous, mut previous_version, mut previous_release) =
         existing.as_ref().map_or((None, None, None), |f| {
@@ -484,12 +545,13 @@ fn pending_updates<'a>(p: &Paths, idx: &'a Index, ids: &[String]) -> Vec<(Card, 
 
 pub fn update(ctx: &Ctx, ids: &[String], fetch: Fetch) -> Result<Value> {
     let _lock = state::lock(&ctx.p)?;
+    let mut act = Activity::new(&ctx.p);
     let idx = state::load_index(&ctx.p)?;
     let ids: Vec<String> = pending_updates(&ctx.p, &idx, ids)
         .into_iter()
         .map(|(c, _)| c.id)
         .collect();
-    let mut v = install_many(ctx, &idx, &ids, fetch)?;
+    let mut v = install_many(ctx, &idx, &ids, fetch, &mut act, &|| false)?;
     if let Some(o) = v.as_object_mut()
         && let Some(apps) = o.remove("apps")
     {
@@ -539,7 +601,17 @@ pub fn rollback(ctx: &Ctx, id: &str) -> Result<Value> {
 /// a card names, (re)build its launcher entry, icon and shims, and drop the
 /// leftovers of apps whose card is gone. `full` redoes every app (`eep
 /// repair`); otherwise only apps that differ are touched (`eep watch`).
+///
+/// One app failing never stops the others: it is listed under `failed`
+/// (and in the activity file while this eep lives), and tried again by the
+/// next pass.
 pub fn reconcile(ctx: &Ctx, full: bool) -> Result<Value> {
+    reconcile_with(ctx, full, &mut Activity::new(&ctx.p))
+}
+
+/// [`reconcile`] for a caller that lives on (`eep watch`): `act` keeps
+/// saying which apps could not be fetched until they are tried again.
+pub fn reconcile_with(ctx: &Ctx, full: bool, act: &mut Activity) -> Result<Value> {
     let _lock = state::lock(&ctx.p)?;
     let p = &ctx.p;
     // Found apps first: it is quick (no download), so the cards of every
@@ -549,7 +621,6 @@ pub fn reconcile(ctx: &Ctx, full: bool) -> Result<Value> {
         Err(e) => json!({ "error": format!("{e:#}") }),
     };
     let recovered = journal::recover(p)?;
-    let fetching = journal::begin(p, "repair")?;
     clean_stale_roots(p);
     let launchers = integrate::launcher_owners(p);
     let cards::Listing {
@@ -558,42 +629,51 @@ pub fn reconcile(ctx: &Ctx, full: bool) -> Result<Value> {
         kept,
         sure,
     } = cards::listing(p);
-    let mut touched = Vec::new();
     // a card that doesn't parse still keeps its app
     let mut ids: BTreeSet<String> = kept;
+    let mut work: Vec<&cards::Found> = Vec::new();
     for f in &good {
         let c = &f.card;
         if !ids.insert(c.id.clone()) || c.is_system() {
             continue; // a second card for the same app: the first one counts
         }
-        let present = Path::new(&c.out).exists();
-        let rooted =
-            present && std::fs::read_link(p.root(&c.id)).is_ok_and(|t| t == Path::new(&c.out));
-        if !full && rooted && integrated(p, c, &launchers) {
-            continue;
+        if full || !ready(p, c) || !integrated(p, c, &launchers) {
+            work.push(f);
         }
-        if full || !rooted {
-            nix::realise(&c.out, &p.root(&c.id))?;
-        }
-        if let Some(prev) = &c.previous
-            && Path::new(prev).exists()
-            && p.prev_root(&c.id).symlink_metadata().is_err()
-        {
-            nix::realise(prev, &p.prev_root(&c.id))?;
-        }
-        let integrated = integrate::integrate(p, c, &ctx.eep)?;
-        // Cards from before icons travelled inside them get theirs now.
-        if c.icon_data.is_none()
-            && let Some(icon) = &integrated.icon
-            && let Ok(bytes) = std::fs::read(icon)
-        {
-            let mut with_icon = c.clone();
-            with_icon.embed_icon(&icon.to_string_lossy(), &bytes);
-            if with_icon.icon_data.is_some() {
-                cards::save(p, &with_icon, Some(&f.file))?;
+    }
+    let mut touched = Vec::new();
+    let mut failed = Vec::new();
+    // Which of them are in the store already (a card back from the Trash,
+    // a repair) and which have to be fetched: one Nix call for all. When
+    // Nix doesn't answer nothing is known, so nothing is touched: guessing
+    // "not here" would move an app that IS here to the index's version.
+    let outs: Vec<String> = work.iter().map(|f| f.card.out.clone()).collect();
+    let absent: BTreeSet<String> = match nix::invalid(&outs) {
+        Ok(absent) => absent,
+        Err(e) => {
+            for f in work.drain(..) {
+                failed.push(json!({
+                    "id": f.card.id, "name": f.card.name, "error": format!("{e:#}"),
+                }));
             }
+            BTreeSet::new()
         }
-        touched.push(json!({ "id": c.id, "fetched": !present }));
+    };
+    let (fetch, here): (Vec<&cards::Found>, Vec<&cards::Found>) =
+        work.into_iter().partition(|f| absent.contains(&f.card.out));
+    // what was said about an app that is fine now, or gone, no longer holds
+    act.keep_only(&fetch.iter().map(|f| f.card.id.as_str()).collect());
+
+    for f in here {
+        match settle(ctx, f) {
+            Ok(()) => touched.push(json!({ "id": f.card.id, "fetched": false })),
+            Err(e) => failed.push(json!({
+                "id": f.card.id, "name": f.card.name, "error": format!("{e:#}"),
+            })),
+        }
+    }
+    if !fetch.is_empty() {
+        fetch_cards(ctx, &fetch, act, &mut touched, &mut failed);
     }
     // Only a sure listing may forget: a moved or unreadable ~/Applications,
     // or a card whose id can't be read, must never uninstall anything.
@@ -603,15 +683,242 @@ pub fn reconcile(ctx: &Ctx, full: bool) -> Result<Value> {
             forgotten.push(integrate::forget(p, id)?);
         }
     }
-    drop(fetching);
     let bad: Vec<Value> = bad
         .into_iter()
         .map(|(f, e)| json!({ "card": f, "error": e }))
         .collect();
     Ok(json!({
-        "ok": true, "apps": touched, "forgotten": forgotten, "bad_cards": bad,
-        "recovered": recovered, "found": found, "sure": sure,
+        "ok": true, "apps": touched, "failed": failed, "forgotten": forgotten,
+        "bad_cards": bad, "recovered": recovered, "found": found, "sure": sure,
     }))
+}
+
+/// An app whose store path is here already: keep it (the root, instant),
+/// make it part of the desktop, and give a card from before icons
+/// travelled inside them its icon.
+fn settle(ctx: &Ctx, f: &cards::Found) -> Result<()> {
+    let (p, c) = (&ctx.p, &f.card);
+    nix::realise(&c.out, &p.root(&c.id))?;
+    finish_card(ctx, f)
+}
+
+/// After the fetch of a card installed as it is named: the previous
+/// version's root, the launcher entry and shims, the card's icon.
+fn finish_card(ctx: &Ctx, f: &cards::Found) -> Result<()> {
+    let (p, c) = (&ctx.p, &f.card);
+    if let Some(prev) = &c.previous
+        && Path::new(prev).exists()
+        && p.prev_root(&c.id).symlink_metadata().is_err()
+    {
+        nix::realise(prev, &p.prev_root(&c.id))?;
+    }
+    let integrated = integrate::integrate(p, c, &ctx.eep)?;
+    if c.icon_data.is_none()
+        && let Some(icon) = &integrated.icon
+        && let Ok(bytes) = std::fs::read(icon)
+    {
+        let mut with_icon = c.clone();
+        with_icon.embed_icon(&icon.to_string_lossy(), &bytes);
+        if with_icon.icon_data.is_some() {
+            cards::save(p, &with_icon, Some(&f.file))?;
+        }
+    }
+    Ok(())
+}
+
+/// Fetch the apps of cards whose store path is not here yet (a card that
+/// arrived in `~/Applications`). An app the index knows is installed as
+/// the index has it today — the current version, with update patches,
+/// never the store paths a card from elsewhere names (as `eep open` does)
+/// — and its card is rewritten to say so. An app the index doesn't have
+/// (another channel, a retired app) is fetched exactly as its card names
+/// it. A card that leaves while its app is fetched stops the fetch.
+fn fetch_cards(
+    ctx: &Ctx,
+    cards: &[&cards::Found],
+    act: &mut Activity,
+    touched: &mut Vec<Value>,
+    failed: &mut Vec<Value>,
+) {
+    let p = &ctx.p;
+    act.begin(cards.iter().map(|f| activity::New {
+        id: &f.card.id,
+        name: &f.card.name,
+        card: Some(&f.file),
+        what: activity::What::Install,
+    }));
+    let idx = current_index(p);
+    let (by_index, as_named): (Vec<&cards::Found>, Vec<&cards::Found>) =
+        cards.iter().copied().partition(|f| {
+            idx.as_ref()
+                .and_then(|i| i.app(&f.card.id))
+                .is_some_and(|a| a.unavailable.is_none())
+        });
+    if let Some(idx) = &idx
+        && !by_index.is_empty()
+    {
+        // Together first: Nix keeps every download slot busy across apps.
+        let mut groups = vec![by_index];
+        while let Some(group) = groups.pop() {
+            let ids: Vec<String> = group.iter().map(|f| f.card.id.clone()).collect();
+            let left = || group.iter().all(|f| !f.file.exists());
+            match install_many(ctx, idx, &ids, Fetch::default(), act, &left) {
+                Ok(_) => touched.extend(ids.iter().map(|id| json!({ "id": id, "fetched": true }))),
+                // one of several failed: each alone, so the others still land
+                Err(_) if group.len() > 1 && !left() => {
+                    groups.extend(group.iter().map(|f| vec![*f]));
+                }
+                Err(e) => group.iter().for_each(|f| give_up(act, failed, f, &e)),
+            }
+        }
+    }
+    for f in as_named {
+        let c = &f.card;
+        let id = [c.id.as_str()];
+        act.state(&id, activity::State::Downloading);
+        // One crash journal per fetch (install_many keeps its own above: a
+        // journal around both would look like a crash to the inner one).
+        let fetched = journal::begin(p, "repair").and_then(|fetching| {
+            let r = nix::realise_watched(&[&c.out], &p.root(&c.id), &mut |progress| {
+                act.progress(&id, progress);
+                f.file.exists()
+            });
+            drop(fetching); // syncs the store, drops the journal
+            r
+        });
+        let fetched = fetched.and_then(|()| {
+            // its card left while the last piece came in: not written back
+            if !f.file.exists() {
+                bail!("stopped");
+            }
+            act.state(&id, activity::State::Finishing);
+            finish_card(ctx, f)
+        });
+        match fetched {
+            Ok(()) => {
+                act.done(&c.id);
+                touched.push(json!({ "id": c.id, "fetched": true }));
+            }
+            Err(e) => give_up(act, failed, f, &e),
+        }
+    }
+}
+
+/// The fetch of `f`'s app ended without it: say why — unless its card left
+/// meanwhile (that stopped the fetch; nothing failed).
+fn give_up(act: &mut Activity, failed: &mut Vec<Value>, f: &cards::Found, e: &anyhow::Error) {
+    if !f.file.exists() {
+        act.done(&f.card.id);
+        return;
+    }
+    let error = format!("{e:#}");
+    act.fail(&f.card.id, &error);
+    failed.push(json!({ "id": f.card.id, "name": f.card.name, "error": error }));
+}
+
+/// The index for an install that starts now: checked with the server when
+/// the last check is a while ago, else as held. `None` when there is none
+/// and none can be had (offline on a first run).
+fn current_index(p: &Paths) -> Option<Index> {
+    if state::index_checked(p).is_none_or(|age| age > INDEX_FRESH)
+        && let Err(e) = state::update_index(p)
+    {
+        eprintln!("eep: the index was not checked: {e:#}");
+    }
+    state::load_index(p).ok()
+}
+
+/// What a file manager's "Install" does: put the card into
+/// `~/Applications` when it is elsewhere — a move, the download is not
+/// left behind — and install its app. The app is not started (`eep open`
+/// does that). With the card in `~/Applications` already it is "try
+/// again".
+pub fn add(ctx: &Ctx, file: &Path) -> Result<Value> {
+    let p = &ctx.p;
+    let text =
+        std::fs::read_to_string(file).with_context(|| format!("reading {}", file.display()))?;
+    let card = Card::parse(&text)?;
+    let mut moved = None;
+    if !cards::in_apps(p, file) && cards::find(p, &card.id).is_none() {
+        std::fs::create_dir_all(&p.apps)?;
+        let target = cards::free_name(p, &card)?;
+        write_atomic(&target, text.as_bytes()).context("moving the card into Applications")?;
+        // best effort: the folder it came from may be read-only
+        let _ = std::fs::remove_file(file);
+        moved = Some(target);
+    }
+    let r = reconcile(ctx, false)?;
+    let now = cards::find(p, &card.id);
+    if let Some(f) = now.as_ref().filter(|f| ready(p, &f.card)) {
+        return Ok(json!({
+            "ok": true, "id": f.card.id, "name": f.card.name, "version": f.card.version,
+            "card": f.file, "moved": moved.is_some(),
+        }));
+    }
+    if card.is_system() {
+        // another computer's app that this one doesn't have: no dead card
+        if let Some(target) = &moved {
+            let _ = std::fs::remove_file(target);
+        }
+        bail!(
+            "{} is not on this computer (it came from another one)",
+            card.name
+        );
+    }
+    let why = r["failed"]
+        .as_array()
+        .and_then(|a| a.iter().find(|x| x["id"] == card.id.as_str()))
+        .and_then(|x| x["error"].as_str())
+        .unwrap_or(if now.is_some() {
+            "it could not be installed"
+        } else {
+            "stopped: its card left Applications"
+        });
+    Ok(json!({
+        "ok": false, "error": why, "id": card.id, "name": card.name,
+        "card": now.map(|f| f.file),
+    }))
+}
+
+/// What a card file is and what installing it would take: for the dialog a
+/// file manager shows before "Install". No network (a dialog must not
+/// wait): sizes come from the index held, when it knows the app.
+pub fn card_info(ctx: &Ctx, file: &Path) -> Result<Value> {
+    let p = &ctx.p;
+    let text =
+        std::fs::read_to_string(file).with_context(|| format!("reading {}", file.display()))?;
+    let card = Card::parse(&text)?;
+    let have = cards::find(p, &card.id);
+    let ready = have.as_ref().is_some_and(|f| ready(p, &f.card));
+    let mut v = json!({
+        "ok": true, "id": card.id, "name": card.name, "kind": card.kind,
+        "version": card.version, "source": card.source, "from": card.from,
+        // the file itself is in ~/Applications
+        "inside": cards::in_apps(p, file),
+        // the card that holds this app in ~/Applications, and whether it can start
+        "installed": have.as_ref().map(|f| &f.file),
+        "ready": ready,
+    });
+    if card.is_system() {
+        v["present"] = json!(system::entry_file(p, &card).is_some());
+        return Ok(v);
+    }
+    if let Ok(idx) = state::load_index(p)
+        && let Some(app) = idx.app(&card.id)
+    {
+        v["index"] = json!({
+            "version": app.version, "unavailable": app.unavailable,
+            "download_full": app.download, "disk": app.disk,
+        });
+        if app.unavailable.is_none()
+            && !ready
+            && let Ok((download, pieces)) = plan(&idx, app)
+        {
+            v["download"] = json!(download);
+            v["pieces"] = json!(pieces);
+        }
+    }
+    Ok(v)
 }
 
 /// `.batch-<pid>` / `.trash-<pid>` roots bridge one command; a command
