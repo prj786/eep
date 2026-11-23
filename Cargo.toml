@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/eep-core", "crates/eep", "crates/eep-build"]
 
 [workspace.package]
-version = "0.3.0-beta"
+version = "0.4.0-beta"
 edition = "2024"
 rust-version = "1.89"
 license = "GPL-3.0-or-later"

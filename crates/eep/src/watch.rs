@@ -253,8 +253,9 @@ fn first_run(p: &crate::paths::Paths) -> bool {
     crate::integrate::known_ids(p).is_empty() && !p.state_dir().join("found.json").exists()
 }
 
+/// A card, or an AppImage file dropped into the folder (it becomes one).
 fn is_card_name(n: &str) -> bool {
-    n.ends_with(".eep") && !n.starts_with('.')
+    (n.ends_with(".eep") && !n.starts_with('.')) || crate::appimage::is_appimage_name(n)
 }
 
 /// Print what a pass did (nothing for a pass that changed nothing).
@@ -303,6 +304,17 @@ pub fn open(ctx: &Ctx, file: &Path, ask: bool) -> Result<Value> {
         if card.is_system() {
             // another computer's app: only if this one has it too
             cards::save(p, &card, None)?;
+        } else if card.is_appimage() {
+            // An AppImage's card says where its file comes from (and, with
+            // a sha256, exactly which file): it goes into Applications and
+            // is fetched from there. Where it was unpacked on the computer
+            // it came from means nothing here.
+            let mut fresh = card.clone();
+            if !ops::ready(p, &fresh) {
+                fresh.desktop = None;
+                fresh.icon = None;
+            }
+            cards::save(p, &fresh, None)?;
         } else {
             // A card from elsewhere (a download) is not trusted: the app
             // is installed as the index has it today, never from the store

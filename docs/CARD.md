@@ -26,11 +26,14 @@ as it is, with no download.
 A card in `~/Applications` is an app, but one that just arrived is not
 there yet. Two things say so, and a file manager needs only these:
 
-**Is it ready?** eep keeps a link to the store path of every app it has
-fetched: `$XDG_STATE_HOME/eep/roots/<id>` (default `~/.local/state/eep/roots/`).
-An eep app can start when that link points at the card's `out`. (A found
-app, `source = "system"`, is always ready.) One `readlink`; the card does
-not change when the app becomes ready, so ask whenever you list the folder.
+**Is it ready?** eep keeps a link to every app it has fetched:
+`$XDG_STATE_HOME/eep/roots/<id>` (default `~/.local/state/eep/roots/`).
+An app can start when that link points at the card's `out`: for an app
+from the Nix cache `out` is its store path and the link's target IS it;
+for an AppImage (`source = "appimage"`, below) `out` is relative to eep's
+data folder (`appimage/<id>/<key>`) and the link's target ENDS with it —
+compare whole path components. (A found app, `source = "system"`, is
+always ready.) One `readlink`; ask whenever you list the folder.
 
 **How far is it?** `$XDG_RUNTIME_DIR/eep/activity.json` (`~/.cache/eep/`
 in a session without a runtime directory) lists what eep is fetching right
@@ -93,6 +96,49 @@ Nothing is downloaded or uninstalled for a found app. Stores that list
 their own pacman/AppImage apps should skip `source = "system"` cards
 (`eep list` leaves them out; `eep list --all` has them).
 
+## AppImages (eep 0.4)
+
+An app that comes as one `.AppImage` file is a card like the others
+(`source = "appimage"`), and lives the same life: the card in
+`~/Applications` installs it, the Trash removes it, eep says how far the
+download is, `eep gc` frees the disk.
+
+```toml
+eep = 0
+id = "obsidian"
+name = "Obsidian"
+kind = "gui"
+source = "appimage"
+version = "1.8.4"
+url = "https://github.com/obsidianmd/obsidian-releases/releases/download/v1.8.4/Obsidian-1.8.4.AppImage"
+repo = "obsidianmd/obsidian-releases"   # optional: where newer versions come from (GitHub releases)
+sha256 = "…64 hex…"          # optional before it is installed; then eep writes it
+size = 123456789
+out = "appimage/obsidian/e8c1169c4af66c31"   # written by eep: where it is unpacked,
+                                             # under ~/.local/share/eep/ (never a home path)
+```
+
+| The user… | What happens |
+|---|---|
+| drops such a card into `~/Applications` | eep downloads the file from `url` (https only), checks it against `sha256` when the card names one, unpacks it once and adds the app to the launcher; the card is rewritten with the hash, the size and `out` |
+| drops an `.AppImage` FILE into `~/Applications` (or `eep add <file>`) | the file becomes a card: it is unpacked, the card is written, the file goes. Such a card has no `url`: it works on this computer, and says so on another one |
+| drops a newer `.AppImage` of the same app | the same card moves to it |
+| moves the card to the Trash / restores it / empties the Trash | as for every eep app: gone from the launcher at once, back with no download, disk freed by `eep gc` |
+
+What is different from an app out of the Nix cache, and worth saying in a
+store: an AppImage brings everything it needs itself (nothing is shared
+with other apps, an update is the whole file again), it is as trustworthy
+as the address in its card (the `sha256` pins the exact file; a card
+without one takes what the address gives — the Install dialog should show
+where it comes from), and updates exist only for cards with a `repo`
+(`eep updates` asks its newest release; `eep update` fetches it and only
+then switches). No rollback.
+
+An AppImage is run from its unpacked tree (`AppRun`, with `APPDIR` set and
+no `APPIMAGE`: the app does not try to replace itself); one that will not
+unpack runs as the file it is. Its launcher entry keeps the name the app
+gave it and starts `eep run <id>`.
+
 ## Fields a file manager or store needs
 
 ```toml
@@ -119,6 +165,7 @@ a card yourself — let eep do it (`eep install <id>` writes one).
 | installed apps | `eep list` (eep's) · `eep list --all` (every card) |
 | open a card | `eep open <file>` (becomes the app; installs it first if needed). `--ask`: when it is not installed, the installer (ewe Files, or `$EEP_INSTALLER`) shows it instead |
 | what a card file is, before installing | `eep card <file>` → `installed` (the card holding this app in Applications), `ready`, `inside`, `download` + `pieces` (what an install would fetch now) |
+| install an `.AppImage` file | `eep add <file.AppImage>`: it becomes a card in `~/Applications` (`{"ok":true,"id","card"}`); the file goes |
 | install from a card file | `eep add <file>`: moves it into `~/Applications`, installs, answers when done (`{"ok":true,"id","card"}`); the app is not started |
 | is eep set up here | `eep doctor` |
 

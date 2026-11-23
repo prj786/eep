@@ -34,7 +34,7 @@ updates come as **binary patches** against what you already have. Nix stays
 the engine: it downloads, checks every signature and hash, and collects
 garbage.
 
-> Status: **0.3.0-beta** (see [PROTOTYPE.md](PROTOTYPE.md)).
+> Status: **0.4.0-beta** (see [PROTOTYPE.md](PROTOTYPE.md)).
 > Tested in the ewe VM and the test container; the `eep` package (below)
 > is opt-in. pacman stays the system's package manager (house rule 10;
 > RFC-010 decides more).
@@ -87,6 +87,8 @@ eep install firefox         # → ~/Applications/Firefox.eep, launcher entry, ic
 eep run firefox             # what the launcher entry calls: clean env, exec
 eep card ~/Downloads/GIMP.eep   # what a card is: installed? ready? how much to download?
 eep add ~/Downloads/GIMP.eep    # Install: the card moves into ~/Applications, the app is fetched
+eep add ~/Downloads/Obsidian-1.8.4.AppImage   # an AppImage becomes a card too (so does one dropped
+                                              # into ~/Applications): unpacked once, run from the tree
 eep open [--ask] <card>     # start the app (install first; --ask: the Install window does it)
 eep list [--all]            # eep's apps (--all: and every app found on the computer)
 eep updates [--count]       # what an update costs, with and without patches
@@ -100,6 +102,13 @@ eep watch                   # follow ~/Applications (a systemd user service; the
 eep doctor                  # check the setup
 sudo eep driver install     # /run/opengl-driver for Nix apps (the one root step)
 ```
+
+AppImages are cards as well (`source = "appimage"`, docs/CARD.md): one file from the
+card's `url`, checked against its `sha256` when it names one, unpacked under
+`~/.local/share/eep/appimage/<id>/<key>` and started from there by `eep run`. A card
+with a `repo` gets its updates from that GitHub repository's newest release
+(`eep updates`, `eep update`). Nothing is shared and nothing is patched: an AppImage
+brings everything itself.
 
 ## Package
 

@@ -647,6 +647,10 @@ fn make_card(
         from: Some(from.to_owned()),
         entry: Some(entry.to_owned()),
         package,
+        url: None,
+        sha256: None,
+        size: None,
+        repo: None,
         channel: String::new(),
         release: String::new(),
         version,
@@ -854,7 +858,7 @@ fn theme_folders(index: &str) -> Vec<(String, u32)> {
 }
 
 /// Too big for a card: a 256 px PNG through ImageMagick, if it is there.
-fn shrink(f: &Path) -> Option<(String, Vec<u8>)> {
+pub(crate) fn shrink(f: &Path) -> Option<(String, Vec<u8>)> {
     let o = std::process::Command::new("magick")
         .args(["-background", "none", "-density", "192"])
         .arg(f)
