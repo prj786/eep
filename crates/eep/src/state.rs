@@ -94,6 +94,19 @@ pub fn index_or_fetch(p: &Paths) -> Result<Index> {
     load_index(p)
 }
 
+/// How long ago the index was last checked with the server (`None`: never,
+/// or there is no index). Every check rewrites the meta file.
+pub fn index_checked(p: &Paths) -> Option<std::time::Duration> {
+    if !p.index_file().exists() {
+        return None;
+    }
+    std::fs::metadata(p.cache.join("index.meta.json"))
+        .and_then(|m| m.modified())
+        .ok()?
+        .elapsed()
+        .ok()
+}
+
 /// Fetch the channel pointer (conditionally) and, when it moved, the index.
 pub fn update_index(p: &Paths) -> Result<Value> {
     let cfg = config(p)?;

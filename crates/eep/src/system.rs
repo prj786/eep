@@ -984,6 +984,7 @@ mod tests {
             config: r.join("home/.config/eep"),
             local_cache: r.join("var/cache/eep/local"),
             driver_farm: r.join("var/lib/eep/opengl-driver"),
+            runtime: r.join("run/eep"),
         };
         let dirs = Dirs {
             user: p.launchers.clone(),

@@ -3,8 +3,11 @@
 //! configured caches, checking every signature and hash itself), to keep
 //! roots, and to collect garbage.
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 
@@ -62,27 +65,260 @@ pub fn realise(out: &str, root: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Realise several paths in one call (Nix downloads across all of them at
-/// once). Roots: `root`, `root-2`, `root-3`… (Nix's naming), all in
-/// `root`'s directory, which the caller removes once each path has its
-/// own root.
-pub fn realise_many(outs: &[&str], root: &Path) -> Result<()> {
+/// How far a fetch is. `done` of `total` are bytes unpacked into the store
+/// (what Nix counts as it copies), `download` the bytes the whole fetch
+/// takes off the network; 0 = not known yet.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Progress {
+    pub done: u64,
+    pub total: u64,
+    pub download: u64,
+}
+
+/// How often the observer of a watched fetch is called at most (and about
+/// how often at least, so a cancel is noticed while a big piece unpacks).
+const OBSERVE: Duration = Duration::from_millis(100);
+
+/// Realise paths in one call (Nix downloads across all of them at once)
+/// while somebody watches: `on` is told how far the fetch is, several
+/// times a second, and stops it by answering `false` (Nix drops the piece
+/// it was fetching; the finished ones stay in the store). A failure reads
+/// as Nix's own last error, in short words.
+///
+/// Roots: `root`, `root-2`, `root-3`… (Nix's naming), all in `root`'s
+/// directory, which the caller removes once each path has its own root.
+pub fn realise_watched(
+    outs: &[&str],
+    root: &Path,
+    on: &mut dyn FnMut(Progress) -> bool,
+) -> Result<()> {
     if let Some(dir) = root.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    let st = nix_store()
+    let mut child = nix_store()
         .arg("--realise")
         .args(outs)
         .arg("--add-root")
         .arg(root)
+        // Nix's activity as JSON lines (what its own progress bar reads)
+        .args(["--log-format", "internal-json"])
         .stdout(Stdio::null())
-        .stderr(Stdio::inherit())
-        .status()
-        .context("running nix-store --realise")?;
-    if !st.success() {
-        bail!("nix-store --realise of {} paths failed ({st})", outs.len());
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("running nix-store --realise (is nix installed?)")?;
+    let log = child.stderr.take().context("nix-store's log")?;
+    let (tx, rx) = mpsc::channel::<Progress>();
+    let reader = std::thread::spawn(move || read_log(log, &tx));
+    let mut now = Progress::default();
+    let mut told: Option<Instant> = None;
+    let mut cancelled = false;
+    loop {
+        match rx.recv_timeout(OBSERVE) {
+            Ok(p) => now = p,
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            // the log closed: nix-store is done
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+        if told.is_none_or(|t| t.elapsed() >= OBSERVE) {
+            told = Some(Instant::now());
+            if !on(now) {
+                cancelled = true;
+                let _ = child.kill();
+                break;
+            }
+        }
     }
+    let st = child.wait().context("waiting for nix-store")?;
+    if cancelled {
+        // the log's reader ends when the pipe closes; a helper of Nix's that
+        // kept it open must not hold the cancel (and eep's lock) up
+        drop(reader);
+        bail!("stopped");
+    }
+    let said = reader.join().ok().flatten();
+    if !st.success() {
+        match said {
+            Some(e) => bail!("{e}"),
+            None => bail!("nix-store --realise of {} paths failed ({st})", outs.len()),
+        }
+    }
+    on(now);
     Ok(())
+}
+
+/// Nix's activity types and result types (`logging.hh`), the ones read here.
+const ACT_COPY_PATH: u64 = 100;
+const ACT_FILE_TRANSFER: u64 = 101;
+const RES_PROGRESS: u64 = 105;
+const RES_SET_EXPECTED: u64 = 106;
+/// Nix's `lvlInfo`: what it prints without `-v`.
+const LVL_INFO: u64 = 3;
+
+/// What Nix's log has said so far about a fetch.
+#[derive(Debug, Default)]
+struct Tracker {
+    /// Pieces being copied now: activity id → (bytes done, its size).
+    copying: HashMap<u64, (u64, u64)>,
+    /// Bytes of the pieces already copied.
+    copied: u64,
+    expected: u64,
+    download: u64,
+    /// Nix's last error, cleaned up.
+    error: Option<String>,
+}
+
+impl Tracker {
+    fn progress(&self) -> Progress {
+        let done = self.copied + self.copying.values().map(|(d, _)| d).sum::<u64>();
+        Progress {
+            done,
+            total: self.expected.max(done),
+            download: self.download,
+        }
+    }
+
+    /// One log line → the text Nix would have printed for it (to pass on),
+    /// and whether the progress changed.
+    fn line(&mut self, line: &str) -> (Option<String>, bool) {
+        let Some(v) = line
+            .strip_prefix("@nix ")
+            .and_then(|j| serde_json::from_str::<serde_json::Value>(j).ok())
+        else {
+            // not the JSON log (an older Nix, a wrapper's own words)
+            return ((!line.trim().is_empty()).then(|| line.to_owned()), false);
+        };
+        let id = v["id"].as_u64().unwrap_or(0);
+        let kind = v["type"].as_u64().unwrap_or(0);
+        let field = |i: usize| v["fields"][i].as_u64().unwrap_or(0);
+        let level = v["level"].as_u64().unwrap_or(u64::MAX);
+        match v["action"].as_str().unwrap_or("") {
+            "msg" => {
+                let text = plain(v["msg"].as_str().unwrap_or(""));
+                if level == 0 {
+                    self.error = Some(short_error(&text));
+                }
+                (
+                    (level <= LVL_INFO && !text.is_empty()).then_some(text),
+                    false,
+                )
+            }
+            "start" => {
+                if kind == ACT_COPY_PATH {
+                    self.copying.insert(id, (0, 0));
+                }
+                let text = v["text"].as_str().unwrap_or("");
+                (
+                    (level <= LVL_INFO && !text.is_empty()).then(|| format!("{text}...")),
+                    false,
+                )
+            }
+            "stop" => match self.copying.remove(&id) {
+                Some((done, size)) => {
+                    self.copied += size.max(done);
+                    (None, true)
+                }
+                None => (None, false),
+            },
+            "result" if kind == RES_PROGRESS => match self.copying.get_mut(&id) {
+                Some(c) => {
+                    *c = (field(0), field(1));
+                    (None, true)
+                }
+                None => (None, false),
+            },
+            "result" if kind == RES_SET_EXPECTED => {
+                match field(0) {
+                    ACT_COPY_PATH => self.expected = field(1),
+                    ACT_FILE_TRANSFER => self.download = field(1),
+                    _ => return (None, false),
+                }
+                (None, true)
+            }
+            _ => (None, false),
+        }
+    }
+}
+
+/// Read nix-store's log to its end: progress goes to `tx` (as it changes,
+/// a few times a second at most), Nix's words to our stderr as before.
+/// → Nix's last error.
+fn read_log(log: impl std::io::Read, tx: &mpsc::Sender<Progress>) -> Option<String> {
+    use std::io::BufRead;
+    let mut t = Tracker::default();
+    let mut sent: Option<(Instant, Progress)> = None;
+    let mut log = std::io::BufReader::new(log);
+    let mut raw = Vec::new();
+    loop {
+        // bytes, not `lines()`: one line that is not UTF-8 (a file name in an
+        // error) must not end the reading — Nix would get a closed pipe
+        raw.clear();
+        match log.read_until(b'\n', &mut raw) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+        let line = String::from_utf8_lossy(&raw);
+        let (say, moved) = t.line(line.trim_end_matches(['\n', '\r']));
+        if let Some(text) = say {
+            eprintln!("{text}");
+        }
+        if moved {
+            let p = t.progress();
+            let due = sent.is_none_or(|(at, was)| was != p && at.elapsed() >= OBSERVE / 2);
+            if due {
+                sent = Some((Instant::now(), p));
+                let _ = tx.send(p);
+            }
+        }
+    }
+    let _ = tx.send(t.progress());
+    t.error
+}
+
+/// Without terminal colours.
+fn plain(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            // an escape sequence ends with a letter
+            for e in chars.by_ref() {
+                if e.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out.trim_end().to_owned()
+}
+
+/// Nix's error for people: no connection said as that, anything else as
+/// Nix said it, on one line, without the `error:` and not a page long.
+fn short_error(text: &str) -> String {
+    let line = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let t = line.strip_prefix("error:").unwrap_or(&line).trim();
+    let offline = [
+        "Could not resolve host",
+        "Couldn't resolve host",
+        "Couldn't connect to server",
+        "Could not connect to server",
+        "Failed to connect",
+        "Network is unreachable",
+        "Timeout was reached",
+        "Connection timed out",
+    ];
+    if offline.iter().any(|s| t.contains(s)) {
+        return "No connection to the app server. Check the internet and try again.".into();
+    }
+    if t.contains("No space left on device") {
+        return "The disk is full.".into();
+    }
+    let mut s: String = t.chars().take(240).collect();
+    if s.len() < t.len() {
+        s.push('…');
+    }
+    s
 }
 
 /// Flush the store to disk: one `syncfs` for the whole filesystem. Nix
@@ -289,6 +525,88 @@ pub fn config(key: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use super::{Progress, Tracker, plain, read_log, short_error};
+
+    /// What Nix 2.36 really logs for a two-piece fetch through the daemon
+    /// (ids shortened, the many progress lines thinned out).
+    const LOG: &str = r#"@nix {"action":"start","id":1,"level":6,"parent":0,"text":"querying info about missing paths","type":0}
+@nix {"action":"stop","id":1}
+@nix {"action":"msg","level":3,"msg":"these 2 paths will be fetched (2.7 MiB download, 8.7 MiB unpacked):"}
+@nix {"action":"msg","level":3,"msg":"  /nix/store/m9y00qgmfbzvlffgbx0hi5hc38dps46q-pcre2-10.49"}
+@nix {"action":"start","id":51,"level":0,"parent":0,"text":"","type":102}
+@nix {"action":"start","id":53,"level":0,"parent":0,"text":"","type":103}
+@nix {"action":"result","fields":[101,2127105],"id":51,"type":106}
+@nix {"action":"result","fields":[100,7040576],"id":51,"type":106}
+@nix {"action":"result","fields":[101,2825502],"id":51,"type":106}
+@nix {"action":"result","fields":[100,9158664],"id":51,"type":106}
+@nix {"action":"start","fields":["/nix/store/m9y00qgmfbzvlffgbx0hi5hc38dps46q-pcre2-10.49","https://cache.nixos.org"],"id":56,"level":0,"parent":0,"text":"","type":108}
+@nix {"action":"start","fields":["/nix/store/m9y00qgmfbzvlffgbx0hi5hc38dps46q-pcre2-10.49","https://cache.nixos.org","local"],"id":57,"level":3,"parent":56,"text":"copying path '/nix/store/m9y00qgmfbzvlffgbx0hi5hc38dps46q-pcre2-10.49' from 'https://cache.nixos.org'","type":100}
+@nix {"action":"start","fields":["https://cache.nixos.org/nar/0hb1.nar.zst"],"id":58,"level":4,"parent":57,"text":"downloading 'https://cache.nixos.org/nar/0hb1.nar.zst'","type":101}
+@nix {"action":"result","fields":[0,0,0,0],"id":52,"type":105}
+@nix {"action":"result","fields":[1564672,2118088,0,0],"id":57,"type":105}
+@nix {"action":"stop","id":58}
+@nix {"action":"stop","id":57}
+@nix {"action":"stop","id":56}
+@nix {"action":"start","fields":["/nix/store/whbrk657qmih065xal60m4khwf6cb9pj-ripgrep-15.2.0","https://cache.nixos.org","local"],"id":60,"level":3,"parent":59,"text":"copying path '/nix/store/whbrk657qmih065xal60m4khwf6cb9pj-ripgrep-15.2.0' from 'https://cache.nixos.org'","type":100}
+@nix {"action":"result","fields":[2662400,7040576,0,0],"id":60,"type":105}
+"#;
+
+    #[test]
+    fn progress_from_nixs_log() {
+        let mut t = Tracker::default();
+        let mut said = Vec::new();
+        for l in LOG.lines() {
+            if let (Some(text), _) = t.line(l) {
+                said.push(text);
+            }
+        }
+        // pcre2 whole (its size, not the last count seen) + ripgrep so far
+        assert_eq!(
+            t.progress(),
+            Progress {
+                done: 2_118_088 + 2_662_400,
+                total: 9_158_664,
+                download: 2_825_502
+            }
+        );
+        // what Nix prints without -v is passed on; chatter is not
+        assert_eq!(said.len(), 4, "{said:?}");
+        assert!(said[0].starts_with("these 2 paths will be fetched"));
+        assert!(said[2].starts_with("copying path '/nix/store/m9y0") && said[2].ends_with("..."));
+        assert!(!said.iter().any(|s| s.contains("downloading")));
+        assert!(t.error.is_none());
+        t.line(r#"@nix {"action":"stop","id":60}"#);
+        assert_eq!(t.progress().done, 2_118_088 + 7_040_576);
+    }
+
+    #[test]
+    fn the_log_reader_reports_and_keeps_the_error() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let log = format!(
+            "{LOG}@nix {{\"action\":\"msg\",\"level\":0,\"msg\":\"\\u001b[31;1merror:\\u001b[0m unable to download 'https://cache.nixos.org/x.narinfo': Could not resolve hostname (6)\"}}\nplain words\n"
+        );
+        let error = read_log(log.as_bytes(), &tx);
+        assert_eq!(
+            error.as_deref(),
+            Some("No connection to the app server. Check the internet and try again.")
+        );
+        let last = rx.try_iter().last().expect("progress was sent");
+        assert_eq!(last.total, 9_158_664);
+    }
+
+    #[test]
+    fn errors_in_short_words() {
+        let said = plain("\u{1b}[31;1merror:\u{1b}[0m  path\n   is  not valid\n");
+        assert_eq!(said, "error:  path\n   is  not valid");
+        assert_eq!(short_error(&said), "path is not valid");
+        assert_eq!(
+            short_error("error: writing to file: No space left on device"),
+            "The disk is full."
+        );
+        let long = short_error(&format!("error: {}", "x".repeat(900)));
+        assert!(long.chars().count() == 241 && long.ends_with('…'));
+    }
+
     #[test]
     fn freed() {
         assert_eq!(

@@ -22,6 +22,10 @@ pub struct Paths {
     pub local_cache: PathBuf,
     /// `/var/lib/eep/opengl-driver`: the driver symlink farm.
     pub driver_farm: PathBuf,
+    /// `$XDG_RUNTIME_DIR/eep` (gone at sign-out): what eep is doing right
+    /// now, for whoever shows it (`activity.json`). Without a runtime
+    /// directory (a bare container) it is the cache folder.
+    pub runtime: PathBuf,
 }
 
 impl Paths {
@@ -29,9 +33,11 @@ impl Paths {
         let home = env_path("HOME").unwrap_or_else(|| PathBuf::from("/"));
         let xdg = |var: &str, dflt: &str| env_path(var).unwrap_or_else(|| home.join(dflt));
         let data_home = xdg("XDG_DATA_HOME", ".local/share");
+        let cache = xdg("XDG_CACHE_HOME", ".cache").join("eep");
         Self {
+            runtime: env_path("XDG_RUNTIME_DIR").map_or_else(|| cache.clone(), |d| d.join("eep")),
             apps: env_path("EEP_APPS_DIR").unwrap_or_else(|| home.join("Applications")),
-            cache: xdg("XDG_CACHE_HOME", ".cache").join("eep"),
+            cache,
             roots: xdg("XDG_STATE_HOME", ".local/state").join("eep/roots"),
             data: data_home.join("eep"),
             launchers: data_home.join("applications"),
@@ -74,6 +80,11 @@ impl Paths {
             .map_or_else(|| self.roots.clone(), Path::to_path_buf)
     }
 
+    /// What eep is fetching right now (see `activity.rs`, docs/CARD.md).
+    pub fn activity_file(&self) -> PathBuf {
+        self.runtime.join("activity.json")
+    }
+
     /// `~/.local/share/eep/hidden`: the user's own launcher entries of
     /// hidden apps, put back when the card comes back.
     pub fn hidden(&self) -> PathBuf {
@@ -114,4 +125,17 @@ pub fn write_atomic(path: &Path, data: &[u8]) -> anyhow::Result<()> {
         .and_then(|d| d.sync_all())
         .with_context(|| format!("sync {}", dir.display()))?;
     Ok(())
+}
+
+/// Like [`write_atomic`] (a reader never sees half a file) but not durable:
+/// for state that is rewritten many times a second and means nothing after
+/// a crash (the activity file).
+pub fn write_quick(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    let dir = path.parent().unwrap_or(Path::new("/"));
+    std::fs::create_dir_all(dir)?;
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    // a temp file of this eep's own: two writers never fill the same one
+    let tmp = dir.join(format!(".{name}.{}.tmp", std::process::id()));
+    std::fs::write(&tmp, data)?;
+    std::fs::rename(&tmp, path)
 }

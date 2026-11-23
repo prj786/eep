@@ -2,27 +2,28 @@
 //! service) follows it with inotify; `eep open` handles a double-clicked
 //! card; `eep setup` wires both into the session.
 
-use std::io::ErrorKind;
-use std::path::Path;
-use std::time::Duration;
+use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use eep_core::card::Card;
-use inotify::{Inotify, WatchMask};
+use inotify::{EventOwned, Inotify, WatchMask};
 use serde_json::{Value, json};
 
+use crate::activity::Activity;
 use crate::ops::{self, Ctx};
 use crate::paths::write_atomic;
 use crate::{cards, run};
 
 /// Quiet time before acting: a copy or a Trash move is several events.
 const DEBOUNCE: Duration = Duration::from_millis(500);
-const TICK: Duration = Duration::from_millis(100);
 
 /// Runs until killed; prints one JSON line per change it acted on.
 pub fn watch(ctx: &Ctx) -> Result<Value> {
     let apps = &ctx.p.apps;
-    let mut ino = Inotify::init().context("inotify")?;
+    let ino = Inotify::init().context("inotify")?;
+    let mut watches = ino.watches();
     let mask = WatchMask::CREATE
         | WatchMask::CLOSE_WRITE
         | WatchMask::DELETE
@@ -41,11 +42,11 @@ pub fn watch(ctx: &Ctx) -> Result<Value> {
     let parent_mask = WatchMask::CREATE | WatchMask::MOVED_TO | WatchMask::ONLYDIR;
     let mut waiting: Option<inotify::WatchDescriptor> = None;
     if apps.is_dir() {
-        ino.watches()
+        watches
             .add(apps, mask)
             .with_context(|| format!("watching {}", apps.display()))?;
     } else if let Some(parent) = apps.parent() {
-        waiting = ino.watches().add(parent, parent_mask).ok();
+        waiting = watches.add(parent, parent_mask).ok();
     }
     // The launcher entries of every app: a package installed or removed,
     // an AppImage added — its card follows. (Folders that don't exist yet,
@@ -60,7 +61,7 @@ pub fn watch(ctx: &Ctx) -> Result<Value> {
     let entry_wds: Vec<inotify::WatchDescriptor> = dirs
         .apps_dirs()
         .iter()
-        .filter_map(|d| ino.watches().add(d, entry_mask).ok())
+        .filter_map(|d| watches.add(d, entry_mask).ok())
         .collect();
     // eep itself: when its file is replaced (an update), the watcher would
     // go on running the old code — it restarts as the new eep instead.
@@ -70,12 +71,20 @@ pub fn watch(ctx: &Ctx) -> Result<Value> {
         .and_then(|e| e.file_name())
         .map(ToOwned::to_owned);
     let exe_wd = exe.as_ref().and_then(|e| e.parent()).and_then(|dir| {
-        ino.watches()
+        watches
             .add(dir, WatchMask::MOVED_TO | WatchMask::CLOSE_WRITE)
             .ok()
     });
-    report(ops::reconcile(ctx, false));
-    let mut buf = [0u8; 8192];
+    // One thread reads the kernel's events; this one acts on them, and can
+    // wake by itself to try an install that failed again.
+    let (tx, rx) = mpsc::channel::<EventOwned>();
+    std::thread::spawn(move || pump(ino, &tx));
+    // What this watcher says about installs: it outlives each pass, so an
+    // app that could not be fetched stays "failed" until the next try.
+    let mut act = Activity::new(&ctx.p);
+    act.sweep();
+    let mut retry = Retry::default();
+    retry.after(&report(ops::reconcile_with(ctx, false, &mut act)));
     let mut seen = Seen::default();
     let me = Me {
         exe_wd: exe_wd.as_ref(),
@@ -83,31 +92,37 @@ pub fn watch(ctx: &Ctx) -> Result<Value> {
         entry_wds: &entry_wds,
     };
     loop {
-        for e in ino.read_events_blocking(&mut buf)? {
-            seen.take(&e, &me, waiting.as_ref());
-            seen.back |= is_back(&e, waiting.as_ref(), apps_name.as_deref());
-        }
-        let mut quiet = Duration::ZERO;
-        while quiet < DEBOUNCE {
-            std::thread::sleep(TICK);
-            match ino.read_events(&mut buf) {
-                Ok(events) => {
-                    let mut any = false;
-                    for e in events {
-                        any = true;
-                        seen.take(&e, &me, waiting.as_ref());
-                        seen.back |= is_back(&e, waiting.as_ref(), apps_name.as_deref());
-                    }
-                    quiet = if any { Duration::ZERO } else { quiet + TICK };
+        let first = match retry.wait() {
+            None => Some(rx.recv().context("inotify stopped")?),
+            Some(wait) => match rx.recv_timeout(wait) {
+                Ok(e) => Some(e),
+                Err(RecvTimeoutError::Timeout) => None,
+                Err(RecvTimeoutError::Disconnected) => bail!("inotify stopped"),
+            },
+        };
+        match first {
+            // time to try the failed installs again
+            None => seen.relevant = true,
+            Some(e) => {
+                let mut next = Some(e);
+                while let Some(e) = next {
+                    seen.take(&e, &me, waiting.as_ref());
+                    seen.back |= is_back(&e, waiting.as_ref(), apps_name.as_deref());
+                    next = match rx.recv_timeout(DEBOUNCE) {
+                        Ok(e) => Some(e),
+                        Err(RecvTimeoutError::Timeout) => None,
+                        Err(RecvTimeoutError::Disconnected) => bail!("inotify stopped"),
+                    };
                 }
-                Err(e) if e.kind() == ErrorKind::WouldBlock => quiet += TICK,
-                Err(e) => return Err(e.into()),
             }
         }
         if std::mem::take(&mut seen.upgraded)
             && let Some(exe) = &exe
         {
             use std::os::unix::process::CommandExt;
+            // the new eep starts with the same pid: leave nothing said under it
+            act = Activity::new(&ctx.p);
+            act.sweep();
             let err = std::process::Command::new(exe).arg("watch").exec();
             eprintln!("eep: restarting as the new eep failed ({err}); going on");
         }
@@ -116,19 +131,65 @@ pub fn watch(ctx: &Ctx) -> Result<Value> {
             // for it to come back.
             seen.relevant = false;
             if let Some(parent) = apps.parent() {
-                waiting = ino.watches().add(parent, parent_mask).ok();
+                waiting = watches.add(parent, parent_mask).ok();
             }
         }
         if std::mem::take(&mut seen.back) && apps.is_dir() {
             if let Some(wd) = waiting.take() {
-                let _ = ino.watches().remove(wd);
+                let _ = watches.remove(wd);
             }
-            ino.watches().add(apps, mask)?;
+            watches.add(apps, mask)?;
             seen.relevant = true;
         }
         if std::mem::take(&mut seen.relevant) {
-            report(ops::reconcile(ctx, false));
+            retry.after(&report(ops::reconcile_with(ctx, false, &mut act)));
         }
+    }
+}
+
+/// Hand the kernel's events to the watcher; ends when either side is gone.
+fn pump(mut ino: Inotify, tx: &mpsc::Sender<EventOwned>) {
+    let mut buf = [0u8; 8192];
+    loop {
+        let Ok(events) = ino.read_events_blocking(&mut buf) else {
+            return;
+        };
+        for e in events {
+            if tx.send(e.to_owned()).is_err() {
+                return;
+            }
+        }
+    }
+}
+
+/// When to try installs that failed again (no network when the card
+/// arrived): soon at first, then less and less often. Any pass without a
+/// failure starts over.
+#[derive(Debug, Default)]
+struct Retry {
+    tries: usize,
+    at: Option<Instant>,
+}
+
+impl Retry {
+    /// Seconds until the next try, by how many failed in a row.
+    const STEPS: [u64; 6] = [20, 60, 180, 600, 1800, 3600];
+
+    fn after(&mut self, pass: &Value) {
+        let failed = pass["ok"] != true || pass["failed"].as_array().is_some_and(|f| !f.is_empty());
+        if failed {
+            let step = Self::STEPS[self.tries.min(Self::STEPS.len() - 1)];
+            self.tries += 1;
+            self.at = Some(Instant::now() + Duration::from_secs(step));
+        } else {
+            *self = Self::default();
+        }
+    }
+
+    /// How long to wait for events before trying again; `None`: nothing failed.
+    fn wait(&self) -> Option<Duration> {
+        self.at
+            .map(|at| at.saturating_duration_since(Instant::now()))
     }
 }
 
@@ -154,14 +215,10 @@ struct Seen {
 }
 
 impl Seen {
-    fn take(
-        &mut self,
-        e: &inotify::Event<&std::ffi::OsStr>,
-        me: &Me<'_>,
-        waiting: Option<&inotify::WatchDescriptor>,
-    ) {
+    fn take(&mut self, e: &EventOwned, me: &Me<'_>, waiting: Option<&inotify::WatchDescriptor>) {
+        let name = e.name.as_deref();
         if Some(&e.wd) == me.exe_wd {
-            self.upgraded |= e.name.is_some_and(|n| Some(n) == me.exe_name);
+            self.upgraded |= name.is_some_and(|n| Some(n) == me.exe_name);
             return;
         }
         if waiting.is_some_and(|w| *w == e.wd) {
@@ -169,13 +226,13 @@ impl Seen {
         }
         if me.entry_wds.contains(&e.wd) {
             // a launcher entry (not eep's temp files, not mimeinfo.cache)
-            self.relevant |= e.name.is_some_and(|n| {
+            self.relevant |= name.is_some_and(|n| {
                 let n = n.to_string_lossy();
                 n.ends_with(".desktop") && !n.starts_with('.')
             });
             return;
         }
-        self.relevant |= e.name.is_none_or(|n| is_card_name(&n.to_string_lossy()));
+        self.relevant |= name.is_none_or(|n| is_card_name(&n.to_string_lossy()));
         self.lost_dir |= e
             .mask
             .intersects(inotify::EventMask::DELETE_SELF | inotify::EventMask::MOVE_SELF);
@@ -184,11 +241,11 @@ impl Seen {
 
 /// An event in the parent while waiting for ~/Applications: is it the folder?
 fn is_back(
-    e: &inotify::Event<&std::ffi::OsStr>,
+    e: &EventOwned,
     waiting: Option<&inotify::WatchDescriptor>,
     apps_name: Option<&std::ffi::OsStr>,
 ) -> bool {
-    waiting.is_some_and(|w| *w == e.wd) && e.name.is_some() && e.name == apps_name
+    waiting.is_some_and(|w| *w == e.wd) && e.name.is_some() && e.name.as_deref() == apps_name
 }
 
 /// Nothing installed or found yet: making ~/Applications can't hide a move.
@@ -200,10 +257,12 @@ fn is_card_name(n: &str) -> bool {
     n.ends_with(".eep") && !n.starts_with('.')
 }
 
-fn report(r: Result<Value>) {
+/// Print what a pass did (nothing for a pass that changed nothing).
+fn report(r: Result<Value>) -> Value {
     let v = r.unwrap_or_else(|e| json!({ "ok": false, "error": format!("{e:#}") }));
     let quiet = v["ok"] == true
         && v["apps"].as_array().is_some_and(Vec::is_empty)
+        && v["failed"].as_array().is_some_and(Vec::is_empty)
         && v["forgotten"].as_array().is_some_and(Vec::is_empty)
         && v["found"]
             .as_object()
@@ -211,19 +270,39 @@ fn report(r: Result<Value>) {
     if !quiet {
         println!("{v}");
     }
+    v
 }
 
-/// Double-clicked card: bring it into `~/Applications` if it isn't there, install
-/// what it names, then become the app.
-pub fn open(ctx: &Ctx, file: &Path) -> Result<Value> {
+/// Double-clicked card: start its app. An app that is not installed yet
+/// is installed first — after the installer has shown it and asked, when
+/// the click came through the card's handler (`ask`).
+pub fn open(ctx: &Ctx, file: &Path, ask: bool) -> Result<Value> {
+    let p = &ctx.p;
     let text =
         std::fs::read_to_string(file).with_context(|| format!("reading {}", file.display()))?;
     let card = Card::parse(&text)?;
-    let inside = file.parent().is_some_and(|d| same_dir(d, &ctx.p.apps));
-    if !inside && cards::find(&ctx.p, &card.id).is_none() {
+    // The usual click: the app is installed. Nothing to bring in line and
+    // no lock to wait for (another app may be downloading right now).
+    if cards::find(p, &card.id).is_some_and(|have| ops::ready(p, &have.card)) {
+        run::run(p, &card.id, None, &[], &[])?;
+        bail!("exec returned")
+    }
+    if ask
+        && !card.is_system()
+        && let Some(ui) = installer()
+    {
+        // The installer (ewe Files) shows the app, its Install button and
+        // how far the install is. It takes over; nothing is installed here.
+        use std::os::unix::process::CommandExt;
+        let mut arg = std::ffi::OsString::from("--install=");
+        arg.push(file.canonicalize().unwrap_or_else(|_| file.to_path_buf()));
+        let err = std::process::Command::new(&ui).arg(arg).exec();
+        eprintln!("eep: {}: {err}; installing without it", ui.display());
+    }
+    if !cards::in_apps(p, file) && cards::find(p, &card.id).is_none() {
         if card.is_system() {
             // another computer's app: only if this one has it too
-            cards::save(&ctx.p, &card, None)?;
+            cards::save(p, &card, None)?;
         } else {
             // A card from elsewhere (a download) is not trusted: the app
             // is installed as the index has it today, never from the store
@@ -238,22 +317,38 @@ pub fn open(ctx: &Ctx, file: &Path) -> Result<Value> {
     if r["ok"] != true {
         return Ok(r);
     }
-    if card.is_system() && cards::find(&ctx.p, &card.id).is_none() {
+    let failure = r["failed"]
+        .as_array()
+        .and_then(|a| a.iter().find(|x| x["id"] == card.id.as_str()));
+    if let Some(why) = failure.and_then(|x| x["error"].as_str()) {
+        bail!("{why}");
+    }
+    if card.is_system() && cards::find(p, &card.id).is_none() {
         // a card for an app this computer doesn't have: nothing to start
         bail!(
             "{} is not on this computer (it came from another one)",
             card.name
         );
     }
-    run::run(&ctx.p, &card.id, None, &[], &[])?;
+    run::run(p, &card.id, None, &[], &[])?;
     bail!("exec returned")
 }
 
-fn same_dir(a: &Path, b: &Path) -> bool {
-    match (a.canonicalize(), b.canonicalize()) {
-        (Ok(x), Ok(y)) => x == y,
-        _ => a == b,
+/// The app that shows a card before it is installed — its icon and name,
+/// the Install button, the progress: ewe Files. `EEP_INSTALLER` names
+/// another one, or none when it is empty (then a click installs at once).
+fn installer() -> Option<PathBuf> {
+    let name = std::env::var_os("EEP_INSTALLER").unwrap_or_else(|| "ewe-files-app".into());
+    if name.is_empty() {
+        return None;
     }
+    let direct = Path::new(&name);
+    if direct.is_absolute() {
+        return direct.is_file().then(|| direct.to_path_buf());
+    }
+    std::env::split_paths(&std::env::var_os("PATH")?)
+        .map(|dir| dir.join(&name))
+        .find(|f| f.is_file())
 }
 
 /// The card file type, the handler and the user units: the files the
@@ -366,7 +461,34 @@ pub fn setup(ctx: &Ctx) -> Result<Value> {
 
 #[cfg(test)]
 mod tests {
-    use super::{HANDLER, PACKAGED_EEP, USER_UNITS};
+    use super::{HANDLER, PACKAGED_EEP, Retry, USER_UNITS};
+    use serde_json::json;
+    use std::time::Duration;
+
+    /// A pass with a failed install is tried again, later and later; a
+    /// clean pass (or one that never ran) waits for events only.
+    #[test]
+    fn failed_installs_are_tried_again_less_and_less_often() {
+        let mut r = Retry::default();
+        assert!(r.wait().is_none(), "nothing failed: only events wake it");
+        let failed = json!({ "ok": true, "failed": [{ "id": "ghost", "error": "x" }] });
+        let mut last = Duration::ZERO;
+        for step in Retry::STEPS {
+            r.after(&failed);
+            let wait = r.wait().expect("a retry is due");
+            assert!(wait <= Duration::from_secs(step) && wait > Duration::from_secs(step - 2));
+            assert!(wait > last, "each wait is longer than the one before");
+            last = wait;
+        }
+        // past the last step it stays there
+        r.after(&failed);
+        assert!(r.wait().expect("still due") > Duration::from_secs(3598));
+        // a pass that could not even start counts as failed; a clean one starts over
+        r.after(&json!({ "ok": false, "error": "nix is not there" }));
+        assert!(r.wait().is_some());
+        r.after(&json!({ "ok": true, "failed": [] }));
+        assert!(r.wait().is_none() && r.tries == 0);
+    }
 
     /// `eep setup` points the shipped files at its own eep by replacing
     /// the packaged path: each must name it.
@@ -379,7 +501,7 @@ mod tests {
                 "{name} without a packaged ExecStart"
             );
         }
-        assert!(HANDLER.contains(&format!("Exec={PACKAGED_EEP} open %f")));
+        assert!(HANDLER.contains(&format!("Exec={PACKAGED_EEP} open --ask %f")));
         let driver = include_str!("../../../packaging/eep-driver.service");
         assert!(driver.contains(&format!("ExecStart={PACKAGED_EEP} driver install")));
     }

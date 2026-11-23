@@ -16,6 +16,17 @@ within a second. Removing such a card **hides** the app from the launcher
 is downloaded or uninstalled (pacman or Komble still do that, and the card
 then goes by itself). `find_apps = false` in the config turns it off.
 
+**Installing shows** (0.3). A card that arrives in `~/Applications` is an
+app that is still coming: eep says which apps it is fetching and how far
+each is (`$XDG_RUNTIME_DIR/eep/activity.json`), and when an app is ready
+(its root link), so ewe Files draws a ring on the card and "Installing
+43%" under it. A click on a card that is not installed opens a small
+Install window (the app's icon and name over one button; `eep open --ask`
+→ ewe Files); Install moves the card into `~/Applications` (`eep add`).
+An install that fails — no network — is tried again by itself; a card that
+leaves while its app downloads stops the download; one app that can't be
+fetched never holds up the others.
+
 Underneath, apps come prebuilt and signed from the Nix binary cache
 (cache.nixos.org). The client **never evaluates Nix**: an eep server
 precomputes an index that says exactly which store paths an app needs, and
@@ -23,7 +34,7 @@ updates come as **binary patches** against what you already have. Nix stays
 the engine: it downloads, checks every signature and hash, and collects
 garbage.
 
-> Status: **0.2.0-beta** (see [PROTOTYPE.md](PROTOTYPE.md)).
+> Status: **0.3.0-beta** (see [PROTOTYPE.md](PROTOTYPE.md)).
 > Tested in the ewe VM and the test container; the `eep` package (below)
 > is opt-in. pacman stays the system's package manager (house rule 10;
 > RFC-010 decides more).
@@ -74,6 +85,9 @@ eep index update            # fetch the newest index (conditional GET)
 eep available               # what can be installed
 eep install firefox         # → ~/Applications/Firefox.eep, launcher entry, icon
 eep run firefox             # what the launcher entry calls: clean env, exec
+eep card ~/Downloads/GIMP.eep   # what a card is: installed? ready? how much to download?
+eep add ~/Downloads/GIMP.eep    # Install: the card moves into ~/Applications, the app is fetched
+eep open [--ask] <card>     # start the app (install first; --ask: the Install window does it)
 eep list [--all]            # eep's apps (--all: and every app found on the computer)
 eep updates [--count]       # what an update costs, with and without patches
 eep update [ids…]           # patches where possible, the rest upstream
