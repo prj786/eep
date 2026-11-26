@@ -875,3 +875,14 @@ it for eep", then "start doing appimages same as eep apps", then "release".
 - Not yet: Komble still installs AppImages its own way (they stay "found"
   apps); AppImage apps in eep's own index; a container e2e case. Never run
   `eep gc` in a test home on a machine with Nix: it collects the real store.
+
+### 2026-11-26: another app's entries, 0.4.1-beta
+
+- **`X-Eep-Skip=true`** on a launcher entry: eep never finds it, so it gets no
+  card. For entries another ewe app writes, updates and deletes itself —
+  ewe Mobile's phone apps (`ewe-mobile-app-<package>.desktop`, ewe Mobile
+  0.2.0-beta), which a card's Trash would otherwise hide behind the owner's
+  back. Seen for real before the rule: 82 phone-app entries became 82
+  `~/Applications` cards within a minute; deleting the entries made eep retire
+  the cards by itself.
+- Unit test: a marked entry beside a found app is never found.

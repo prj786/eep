@@ -92,6 +92,11 @@ icon_data = "…"
 | uninstalls it (pacman, Komble) | its card goes by itself |
 | double-clicks the card | the app starts (GIO launches its entry) |
 
+An entry marked `X-Eep-Skip=true` is never found: another ewe app writes,
+updates and deletes it itself (ewe Mobile's phone apps,
+`ewe-mobile-app-<package>.desktop`), so it shows in the launcher without a
+card.
+
 Nothing is downloaded or uninstalled for a found app. Stores that list
 their own pacman/AppImage apps should skip `source = "system"` cards
 (`eep list` leaves them out; `eep list --all` has them).
