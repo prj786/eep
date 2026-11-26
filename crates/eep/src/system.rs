@@ -37,6 +37,9 @@ use crate::paths::{Paths, write_atomic};
 /// eep's mark on the copy that hides an app: `X-Eep-Hides=<card id>`.
 const HIDES: &str = "X-Eep-Hides";
 
+/// Another app's mark on an entry it owns: `X-Eep-Skip=true` — no card.
+const SKIP: &str = "X-Eep-Skip";
+
 /// Where launcher entries and icons are looked for.
 #[derive(Debug, Clone)]
 pub struct Dirs {
@@ -166,6 +169,12 @@ fn look(text: &str, _dirs: &Dirs) -> Look {
         return Look::EepApp;
     }
     let yes = |k: &str| get(k).is_some_and(|v| v.eq_ignore_ascii_case("true"));
+    // Entries another ewe app writes and owns (ewe Mobile's phone apps,
+    // `X-Ewe-Mobile-App`): shown in the launcher, but no card — the card's
+    // Trash would hide an entry its owner rewrites and deletes by itself.
+    if yes(SKIP) {
+        return Look::NotApp;
+    }
     let app = get("Type").as_deref() == Some("Application")
         && !yes("NoDisplay")
         && !yes("Hidden")
@@ -1044,6 +1053,13 @@ mod tests {
         std::fs::write(t.dirs.system[0].join("helper.desktop"), helper).expect("write");
         let gone = entry("Broken", "TryExec=/nonexistent/AppRun\n");
         std::fs::write(t.dirs.system[0].join("broken.desktop"), gone).expect("write");
+        // another app's entry (ewe Mobile's phone apps): shown, never a card
+        let phone = entry("WhatsApp", "X-Eep-Skip=true\n");
+        std::fs::write(
+            t.dirs.user.join("ewe-mobile-app-com.whatsapp.desktop"),
+            phone,
+        )
+        .expect("write");
         let icon = t.dirs.icons[0].join("hicolor/scalable/apps/app.svg");
         std::fs::create_dir_all(icon.parent().expect("dir")).expect("mkdir");
         std::fs::write(&icon, "<svg/>").expect("icon");
