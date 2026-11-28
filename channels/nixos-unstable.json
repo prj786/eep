@@ -1,0 +1,8 @@
+{
+  "eep_channel": 0,
+  "channel": "nixos-unstable",
+  "release": "nixos-26.11pre1129576.58d0d3e9d527",
+  "released": "2026-11-28T06:31:07Z",
+  "index": "nixos-26.11pre1129576.58d0d3e9d527/index.json.zst",
+  "sha256": "f039607eb64f2217a3b0e50ab11dad55c36dec5ed057994fe4d97ed68fbcccb7"
+}
